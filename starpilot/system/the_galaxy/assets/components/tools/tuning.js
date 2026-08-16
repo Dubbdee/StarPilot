@@ -256,7 +256,7 @@ function selectCustomPreset(presetKey) {
   state.customTrialValues = cloneJson(preset.values)
 }
 
-async function loadCustomTrialSchema(reportId) {
+async function loadCustomTrialSchema(reportId, preferredPreset = "") {
   state.customTrialSchema = null
   state.customTrialValues = null
   state.customTrialPreset = ""
@@ -264,16 +264,24 @@ async function loadCustomTrialSchema(reportId) {
   if (!reportId || state.report?.car?.controlPath !== "torque") return
   try {
     state.loadingCustomTrial = true
-    const response = await fetch(`/api/flm/report/${encodeURIComponent(reportId)}/custom-trial`)
+    const response = await fetch(`/api/flm/report/${encodeURIComponent(reportId)}/custom-trial`, { cache: "no-store" })
     const payload = await response.json()
     if (!response.ok) throw new Error(payload.error || "Failed to load custom trial controls.")
     state.customTrialSchema = payload
-    selectCustomPreset(payload.defaultPreset || "current")
+    selectCustomPreset(preferredPreset || payload.defaultPreset || "current")
   } catch (error) {
     state.error = error?.message || "Failed to load custom trial controls."
   } finally {
     state.loadingCustomTrial = false
   }
+}
+
+async function fillCustomPreset(presetKey) {
+  if (presetKey !== "current") {
+    selectCustomPreset(presetKey)
+    return
+  }
+  await loadCustomTrialSchema(state.report?.reportId, "current")
 }
 
 async function loadReport(reportId) {
@@ -533,7 +541,7 @@ async function applyProfile(profileId) {
     const payload = await response.json()
     if (!response.ok) throw new Error(payload.error || "Failed to apply trial profile.")
     state.error = ""
-    await fetchWorkspace()
+    await Promise.all([fetchWorkspace(), loadCustomTrialSchema(state.report.reportId, "current")])
     showSnackbar(payload.message || "Trial profile applied.")
   } catch (error) {
     state.error = error?.message || "Failed to apply trial profile."
@@ -653,6 +661,7 @@ async function applySavedTune(tuneId) {
     if (!response.ok) throw new Error(payload.error || "Failed to apply saved tune.")
     state.error = ""
     state.workspace = payload.workspace || state.workspace
+    await loadCustomTrialSchema(state.report?.reportId, "current")
     showSnackbar(payload.message || "Saved tune applied.")
   } catch (error) {
     state.error = error?.message || "Failed to apply saved tune."
@@ -1267,8 +1276,8 @@ function renderCustomTrialEditor() {
         ${Object.entries(schema.presets || {}).map(([key, preset]) => html`
           <button
             class="${() => `longManeuverButton ${state.customTrialPreset === key ? "selected" : ""}`}"
-            disabled="${() => state.runningAction}"
-            @click="${() => selectCustomPreset(key)}">
+            disabled="${() => state.runningAction || state.loadingCustomTrial}"
+            @click="${() => fillCustomPreset(key)}">
             ${preset.label}
           </button>
         `)}

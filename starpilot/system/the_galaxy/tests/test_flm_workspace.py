@@ -1134,6 +1134,52 @@ def test_custom_trial_schema_exposes_every_supported_knob_and_analysis_seed(tmp_
   }
 
 
+def test_custom_trial_schema_refills_from_active_saved_tune(tmp_path):
+  module, fake_params_cls = _load_flm_workspace_module(tmp_path)
+  report, supported, first_symbol, _ = _write_custom_trial_report(module)
+  schema = module.build_custom_trial_schema(report["reportId"])
+  values = json.loads(json.dumps(schema["presets"]["recommended"]["values"]))
+  first_control = next(control for control in schema["controls"]["vehicleKnobs"] if control["key"] == first_symbol)
+  values["genericParams"]["SteerLatAccel"] = 2.123
+  values["flmOverrides"]["vehicleKnobs"][first_symbol] = min(
+    float(first_control["max"]),
+    float(values["flmOverrides"]["vehicleKnobs"][first_symbol]) + 0.02,
+  )
+  family = schema["controls"]["frictionCurve"]["family"]
+  values["flmOverrides"]["baseFrictionThresholds"][family]["values"][2] = 0.433
+  fake_params_cls._store = {
+    "IsOnroad": False,
+    "AdvancedLateralTune": False,
+    "ForceAutoTune": True,
+    "ForceAutoTuneOff": False,
+    "UseAutoSteerDelay": True,
+    "SteerDelay": 0.25,
+    "SteerFriction": 0.1,
+    "SteerKP": 1.0,
+    "SteerLatAccel": 1.5,
+    "SteerRatio": 15.0,
+    "FLMActiveProfileId": "",
+    "FLMActiveOverrides": {},
+    "FLMTrialApplied": False,
+  }
+
+  module.apply_custom_trial(report["reportId"], values)
+  module.save_active_trial_as_tune("My road tune")
+  reloaded_schema = module.build_custom_trial_schema(report["reportId"])
+  current = reloaded_schema["presets"]["current"]
+
+  assert reloaded_schema["currentPresetSource"] == "active_trial"
+  assert reloaded_schema["currentTrialActive"] is True
+  assert reloaded_schema["defaultPreset"] == "current"
+  assert current["label"] == "Current (Active Tune)"
+  assert current["values"]["genericParams"] == values["genericParams"]
+  assert set(current["values"]["flmOverrides"]["vehicleKnobs"]) == set(supported)
+  assert current["values"]["flmOverrides"]["vehicleKnobs"][first_symbol] == pytest.approx(
+    values["flmOverrides"]["vehicleKnobs"][first_symbol]
+  )
+  assert current["values"]["flmOverrides"]["baseFrictionThresholds"][family]["values"][2] == pytest.approx(0.433)
+
+
 def test_custom_trial_validation_requires_all_knobs_and_enforces_bounds(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
   report, _, _, _ = _write_custom_trial_report(module)

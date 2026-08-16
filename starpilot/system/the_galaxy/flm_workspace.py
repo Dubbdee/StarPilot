@@ -3280,6 +3280,41 @@ def _complete_custom_trial_values(report: dict[str, Any], profile: dict[str, Any
   }
 
 
+def _current_custom_trial_values(report: dict[str, Any]) -> tuple[dict[str, Any], str, bool]:
+  """Build the Current preset from live device params when they match this report's car."""
+  params = Params(return_defaults=True)
+  current_state = _snapshot_current_trial_state(params)
+  trial_active = bool(current_state.get("FLMTrialApplied", False))
+  paths = ensure_flm_workspace()
+  active_snapshot = _read_json(paths["snapshots"] / "active.json", {})
+  if not isinstance(active_snapshot, dict):
+    active_snapshot = {}
+
+  report_fingerprint = str(report.get("car", {}).get("carFingerprint", "") or "")
+  current_fingerprint = _current_car_identity(params)["carFingerprint"]
+  if not current_fingerprint and trial_active:
+    current_fingerprint = _active_trial_car_fingerprint(paths, active_snapshot)
+
+  # Without any device/trial identity, retain the report snapshot. This keeps
+  # offline report viewing deterministic and avoids mixing values across cars.
+  if (
+    (report_fingerprint and current_fingerprint and report_fingerprint != current_fingerprint)
+    or (report_fingerprint and not current_fingerprint and not trial_active)
+  ):
+    return _complete_custom_trial_values(report), "analysis", False
+
+  report_current = report.get("currentParams", {}) if isinstance(report.get("currentParams"), dict) else {}
+  live_report = {
+    **report,
+    "currentParams": {
+      **report_current,
+      **current_state,
+    },
+  }
+  source = "active_trial" if trial_active else "device"
+  return _complete_custom_trial_values(live_report), source, trial_active
+
+
 def build_custom_trial_schema(report_id: str) -> dict[str, Any]:
   report = load_report(report_id)
   if report.get("car", {}).get("controlPath") != "torque":
@@ -3288,9 +3323,13 @@ def build_custom_trial_schema(report_id: str) -> dict[str, Any]:
   supported_knobs = _custom_trial_supported_knobs(report)
   profiles, selected_path = _custom_trial_profiles(report)
   report_rationales = _custom_report_rationales(selected_path)
+  current_values, current_source, current_trial_active = _current_custom_trial_values(report)
   presets = {
     "stock": {"label": "Stock", "values": _complete_custom_trial_values(report, use_stock=True)},
-    "current": {"label": "Current", "values": _complete_custom_trial_values(report)},
+    "current": {
+      "label": "Current (Active Tune)" if current_trial_active else "Current",
+      "values": current_values,
+    },
   }
   for profile in profiles:
     label = str(profile.get("label", "") or "").strip()
@@ -3303,7 +3342,7 @@ def build_custom_trial_schema(report_id: str) -> dict[str, Any]:
       "values": _complete_custom_trial_values(report, profile=profile),
     }
 
-  default_preset = "recommended" if "recommended" in presets else "current"
+  default_preset = "current" if current_trial_active else ("recommended" if "recommended" in presets else "current")
   generic_controls = [{
     "key": "UseAutoSteerDelay",
     "label": CUSTOM_GENERIC_PARAM_LABELS["UseAutoSteerDelay"],
@@ -3353,6 +3392,8 @@ def build_custom_trial_schema(report_id: str) -> dict[str, Any]:
     "pathKey": str(selected_path.get("key", "") or ""),
     "pathLabel": str(selected_path.get("title", "") or ""),
     "defaultPreset": default_preset,
+    "currentPresetSource": current_source,
+    "currentTrialActive": current_trial_active,
     "forcedSettings": {
       "AdvancedLateralTune": True,
       "ForceAutoTune": False,
