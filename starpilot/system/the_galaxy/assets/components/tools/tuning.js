@@ -16,9 +16,17 @@ const state = reactive({
   routeProgress: 0,
   routeTotal: 0,
   connectDongleId: "",
-  workspace: { reports: [], savedTunes: [], activeTrial: null, status: {} },
+  workspace: { reports: [], savedTunes: [], uploads: [], activeTrial: null, status: {} },
   status: {},
   report: null,
+  customTrialSchema: null,
+  customTrialPreset: "",
+  customTrialValues: null,
+  customTrialHelpKey: "",
+  loadingCustomTrial: false,
+  uploadFiles: [],
+  uploadLabel: "",
+  uploadProgress: 0,
   feedbackAccepted: [],
   feedbackIgnored: [],
   feedbackNotes: "",
@@ -55,6 +63,18 @@ function formatReportSegmentRanges(report) {
 function safeCount(value) {
   const n = Number(value)
   return Number.isFinite(n) ? n : 0
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, safeCount(value))
+  if (bytes < 1024) return `${Math.round(bytes)} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value))
 }
 
 function formatRouteLength(route) {
@@ -229,6 +249,33 @@ function syncFeedbackState(report) {
   state.feedbackNotes = typeof feedback.notes === "string" ? feedback.notes : ""
 }
 
+function selectCustomPreset(presetKey) {
+  const preset = state.customTrialSchema?.presets?.[presetKey]
+  if (!preset?.values) return
+  state.customTrialPreset = presetKey
+  state.customTrialValues = cloneJson(preset.values)
+}
+
+async function loadCustomTrialSchema(reportId) {
+  state.customTrialSchema = null
+  state.customTrialValues = null
+  state.customTrialPreset = ""
+  state.customTrialHelpKey = ""
+  if (!reportId || state.report?.car?.controlPath !== "torque") return
+  try {
+    state.loadingCustomTrial = true
+    const response = await fetch(`/api/flm/report/${encodeURIComponent(reportId)}/custom-trial`)
+    const payload = await response.json()
+    if (!response.ok) throw new Error(payload.error || "Failed to load custom trial controls.")
+    state.customTrialSchema = payload
+    selectCustomPreset(payload.defaultPreset || "current")
+  } catch (error) {
+    state.error = error?.message || "Failed to load custom trial controls."
+  } finally {
+    state.loadingCustomTrial = false
+  }
+}
+
 async function loadReport(reportId) {
   if (!reportId) return
   try {
@@ -237,7 +284,7 @@ async function loadReport(reportId) {
     if (!response.ok) throw new Error(payload.error || "Failed to load tuning report.")
     state.report = payload
     syncFeedbackState(payload)
-    await fetchWorkspace()
+    await Promise.all([fetchWorkspace(), loadCustomTrialSchema(reportId)])
   } catch (error) {
     state.error = error?.message || "Failed to load tuning report."
   }
@@ -255,6 +302,10 @@ async function deleteReport(reportId) {
 
     if (state.report?.reportId === reportId) {
       state.report = null
+      state.customTrialSchema = null
+      state.customTrialValues = null
+      state.customTrialPreset = ""
+      state.customTrialHelpKey = ""
       syncFeedbackState(null)
     }
     state.workspace = payload.workspace || state.workspace
@@ -360,6 +411,75 @@ function clearSelections() {
   state.segmentRanges = {}
 }
 
+function setUploadFiles(event) {
+  state.uploadFiles = Array.from(event?.target?.files || [])
+  state.uploadProgress = 0
+}
+
+async function uploadRlogs() {
+  if (!state.uploadFiles.length || state.runningAction || state.status?.isOnroad) return
+  state.runningAction = true
+  state.uploadProgress = 0
+  try {
+    const formData = new FormData()
+    for (const file of state.uploadFiles) formData.append("files", file, file.name)
+    formData.append("label", state.uploadLabel || "")
+    const payload = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open("POST", "/api/flm/uploads")
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) state.uploadProgress = Math.round((event.loaded / event.total) * 100)
+      }
+      xhr.onerror = () => reject(new Error("The rlog upload could not reach Galaxy."))
+      xhr.onload = () => {
+        let responsePayload = {}
+        try { responsePayload = xhr.responseText ? JSON.parse(xhr.responseText) : {} } catch (_) {}
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(responsePayload.error || "Failed to upload rlogs."))
+          return
+        }
+        resolve(responsePayload)
+      }
+      xhr.send(formData)
+    })
+    state.error = ""
+    state.workspace = payload.workspace || state.workspace
+    if (payload.upload?.routeName && !state.selectedRoutes.includes(payload.upload.routeName)) {
+      state.selectedRoutes = [...state.selectedRoutes, payload.upload.routeName]
+    }
+    state.uploadFiles = []
+    state.uploadLabel = ""
+    state.uploadProgress = 100
+    const input = document.getElementById("flmRlogFiles")
+    if (input) input.value = ""
+    showSnackbar(payload.message || "Rlogs uploaded.")
+  } catch (error) {
+    state.error = error?.message || "Failed to upload rlogs."
+    showSnackbar(state.error, "error")
+  } finally {
+    state.runningAction = false
+  }
+}
+
+async function deleteUploadedRlogs(upload) {
+  if (!upload?.uploadId || state.runningAction) return
+  if (!window.confirm(`Delete ${upload.fileCount || 0} uploaded rlog file(s)${upload.label ? ` from "${upload.label}"` : ""}?`)) return
+  state.runningAction = true
+  try {
+    const response = await fetch(`/api/flm/uploads/${encodeURIComponent(upload.uploadId)}`, { method: "DELETE" })
+    const payload = await response.json()
+    if (!response.ok) throw new Error(payload.error || "Failed to delete uploaded rlogs.")
+    state.workspace = payload.workspace || state.workspace
+    state.selectedRoutes = state.selectedRoutes.filter((route) => route !== upload.routeName)
+    showSnackbar(payload.message || "Uploaded rlogs deleted.")
+  } catch (error) {
+    state.error = error?.message || "Failed to delete uploaded rlogs."
+    showSnackbar(state.error, "error")
+  } finally {
+    state.runningAction = false
+  }
+}
+
 async function runAnalyze() {
   if (!state.selectedRoutes.length || state.runningAction) return
   state.runningAction = true
@@ -417,6 +537,81 @@ async function applyProfile(profileId) {
     showSnackbar(payload.message || "Trial profile applied.")
   } catch (error) {
     state.error = error?.message || "Failed to apply trial profile."
+    showSnackbar(state.error, "error")
+  } finally {
+    state.runningAction = false
+  }
+}
+
+function setCustomGenericValue(key, value) {
+  if (!state.customTrialValues) return
+  state.customTrialPreset = "custom"
+  state.customTrialValues = {
+    ...state.customTrialValues,
+    genericParams: {
+      ...(state.customTrialValues.genericParams || {}),
+      [key]: value,
+    },
+  }
+}
+
+function setCustomFrictionValue(index, value) {
+  if (!state.customTrialValues || !state.customTrialSchema) return
+  const family = state.customTrialSchema.controls.frictionCurve.family
+  const currentOverrides = state.customTrialValues.flmOverrides || {}
+  const currentFamily = currentOverrides.baseFrictionThresholds?.[family] || {}
+  const values = [...(currentFamily.values || [])]
+  values[index] = value
+  state.customTrialPreset = "custom"
+  state.customTrialValues = {
+    ...state.customTrialValues,
+    flmOverrides: {
+      ...currentOverrides,
+      baseFrictionThresholds: {
+        ...(currentOverrides.baseFrictionThresholds || {}),
+        [family]: { ...currentFamily, values },
+      },
+    },
+  }
+}
+
+function setCustomKnobValue(key, value) {
+  if (!state.customTrialValues) return
+  const currentOverrides = state.customTrialValues.flmOverrides || {}
+  state.customTrialPreset = "custom"
+  state.customTrialValues = {
+    ...state.customTrialValues,
+    flmOverrides: {
+      ...currentOverrides,
+      vehicleKnobs: {
+        ...(currentOverrides.vehicleKnobs || {}),
+        [key]: value,
+      },
+    },
+  }
+}
+
+async function applyCustomTrial() {
+  if (!state.report?.reportId || !state.customTrialValues || state.runningAction || state.status?.isOnroad) return
+  const knobCount = safeCount(state.customTrialSchema?.vehicleKnobCount)
+  if (!window.confirm(
+    `Apply this exact custom FLM trial with ${knobCount} vehicle controls? Revert Trial will restore the settings from before the FLM trial. Apply while parked and evaluate changes cautiously.`
+  )) return
+
+  state.runningAction = true
+  try {
+    const response = await fetch(`/api/flm/report/${encodeURIComponent(state.report.reportId)}/custom-trial`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.customTrialValues),
+    })
+    const payload = await response.json()
+    if (!response.ok) throw new Error(payload.error || "Failed to apply custom FLM trial.")
+    state.error = ""
+    state.workspace = payload.workspace || state.workspace
+    showSnackbar(payload.message || "Custom FLM trial applied.")
+  } catch (error) {
+    state.error = error?.message || "Failed to apply custom FLM trial."
     showSnackbar(state.error, "error")
   } finally {
     state.runningAction = false
@@ -556,6 +751,7 @@ async function selectPath(pathKey) {
     if (!response.ok) throw new Error(payload.error || "Failed to select tuning path.")
     state.report = payload.report
     syncFeedbackState(state.report)
+    await loadCustomTrialSchema(state.report.reportId)
     showSnackbar(payload.message || "Tuning path selected.")
   } catch (error) {
     state.error = error?.message || "Failed to select tuning path."
@@ -647,7 +843,7 @@ async function saveFeedback() {
       profiles: payload.profiles || state.report.profiles,
     }
     syncFeedbackState(state.report)
-    await fetchWorkspace()
+    await Promise.all([fetchWorkspace(), loadCustomTrialSchema(state.report.reportId)])
     showSnackbar(payload.message || "Feedback saved.")
   } catch (error) {
     state.error = error?.message || "Failed to save tuning feedback."
@@ -987,6 +1183,201 @@ function renderTrackingOverview() {
   `
 }
 
+function toggleCustomTrialHelp(helpKey, event) {
+  event?.preventDefault?.()
+  event?.stopPropagation?.()
+  state.customTrialHelpKey = state.customTrialHelpKey === helpKey ? "" : helpKey
+}
+
+function renderCustomTrialHelp(help) {
+  if (!help?.summary) return ""
+  const analysis = Array.isArray(help.analysis) ? help.analysis : []
+  return html`
+    <div class="flmControlHelp">
+      <p>${help.summary}</p>
+      ${help.more ? html`<p><strong>${help.moreLabel || "Higher value"}:</strong> ${help.more}</p>` : ""}
+      ${help.less ? html`<p><strong>${help.lessLabel || "Lower value"}:</strong> ${help.less}</p>` : ""}
+      ${help.whyThisControl ? html`<p><strong>Why FLM uses it:</strong> ${help.whyThisControl}</p>` : ""}
+      ${analysis.length ? html`
+        <div class="flmControlAnalysisHelp">
+          <strong>Why this analysis selected it</strong>
+          ${analysis.map((rationale) => html`
+            <div>
+              ${rationale.observedBehavior ? html`<p><strong>Observed:</strong> ${rationale.observedBehavior}</p>` : ""}
+              ${rationale.likelyInterpretation ? html`<p><strong>Interpretation:</strong> ${rationale.likelyInterpretation}</p>` : ""}
+              ${rationale.primaryAdjustment ? html`<p><strong>Suggested move:</strong> ${rationale.primaryAdjustment}</p>` : ""}
+              ${rationale.whyThisKnob ? html`<p><strong>Rationale:</strong> ${rationale.whyThisKnob}</p>` : ""}
+              ${rationale.logSupport ? html`<p><strong>Log support:</strong> ${rationale.logSupport}</p>` : ""}
+            </div>
+          `)}
+        </div>
+      ` : ""}
+    </div>
+  `
+}
+
+function renderCustomFieldHeading(label, helpKey, help) {
+  return html`
+    <div class="flmCustomFieldHeading">
+      <span>${label}</span>
+      ${help?.summary ? html`
+        <button
+          type="button"
+          class="flmControlHelpButton"
+          title="Explain what this control changes"
+          aria-label="Explain ${label}"
+          aria-expanded="${() => state.customTrialHelpKey === helpKey}"
+          @click="${event => toggleCustomTrialHelp(helpKey, event)}">?</button>
+      ` : ""}
+    </div>
+    ${() => state.customTrialHelpKey === helpKey ? renderCustomTrialHelp(help) : ""}
+  `
+}
+
+function renderCustomTrialEditor() {
+  if (state.loadingCustomTrial) {
+    return html`<section class="flmCard"><h3>Custom Active Trial</h3><p class="longManeuverMuted">Loading every available FLM control...</p></section>`
+  }
+  const schema = state.customTrialSchema
+  const values = state.customTrialValues
+  if (!schema || !values) return ""
+  const genericControls = schema.controls?.genericParams || []
+  const friction = schema.controls?.frictionCurve || {}
+  const frictionValues = values.flmOverrides?.baseFrictionThresholds?.[friction.family]?.values || []
+  const vehicleControls = schema.controls?.vehicleKnobs || []
+  return html`
+    <section class="flmCard flmCustomTrial">
+      <div class="flmCardHeader">
+        <div>
+          <h3>Custom Active Trial</h3>
+          <p class="longManeuverMuted">
+            Start from the analysis result, then edit every supported value. This report exposes ${schema.vehicleKnobCount} vehicle controls plus generic settings and the five-point ${friction.family} friction curve.
+          </p>
+        </div>
+        <button
+          class="longManeuverButton"
+          disabled="${() => state.runningAction || state.status?.isOnroad || !state.customTrialValues || state.workspace?.activeTrial?.rollbackAvailable === false}"
+          @click="${applyCustomTrial}">
+          Apply Custom Trial
+        </button>
+      </div>
+
+      <div class="flmCustomPresetBar">
+        <strong>Fill from:</strong>
+        ${Object.entries(schema.presets || {}).map(([key, preset]) => html`
+          <button
+            class="${() => `longManeuverButton ${state.customTrialPreset === key ? "selected" : ""}`}"
+            disabled="${() => state.runningAction}"
+            @click="${() => selectCustomPreset(key)}">
+            ${preset.label}
+          </button>
+        `)}
+        ${() => state.customTrialPreset === "custom" ? html`<span class="flmCustomBadge">Edited</span>` : ""}
+      </div>
+
+      <div class="flmTrackingNotice">
+        Custom trials force Advanced Lateral Tune on and automatic torque tuning off so the entered values remain active. Server-side limits still apply. Apply only while parked; stay ready to steer and use Revert Trial if behavior is not clearly better.
+      </div>
+
+      <div class="flmCustomSection">
+        <h4>Generic Lateral Settings</h4>
+        <div class="flmCustomGrid">
+          ${genericControls.map((control) => control.type === "boolean" ? html`
+            <div class="flmCustomField flmCustomBoolean">
+              ${renderCustomFieldHeading(control.label, `generic:${control.key}`, control.help)}
+              <input
+                type="checkbox"
+                aria-label="${control.label}"
+                checked="${() => !!state.customTrialValues?.genericParams?.[control.key]}"
+                @change="${event => setCustomGenericValue(control.key, event.target.checked)}" />
+              <code>${control.key}</code>
+            </div>
+          ` : html`
+            <div class="flmCustomField">
+              ${renderCustomFieldHeading(control.label, `generic:${control.key}`, control.help)}
+              <input
+                type="number"
+                aria-label="${control.label}"
+                min="${control.min}"
+                max="${control.max}"
+                step="${control.precision}"
+                value="${() => state.customTrialValues?.genericParams?.[control.key] ?? ""}"
+                @input="${event => setCustomGenericValue(control.key, event.target.value)}" />
+              <small>${control.min} to ${control.max}, step ${control.precision}</small>
+              <code>${control.key}</code>
+            </div>
+          `)}
+        </div>
+      </div>
+
+      <div class="flmCustomSection">
+        <h4>${friction.family} Friction Threshold Curve</h4>
+        <div class="flmCustomGrid flmFrictionGrid">
+          ${(friction.speedKnots || []).map((speed, index) => html`
+            <div class="flmCustomField">
+              ${renderCustomFieldHeading(
+                `${Number(speed).toFixed(0)} m/s (${Math.round(Number(speed) * 3.6)} km/h, ${Math.round(Number(speed) * 2.23694)} mph)`,
+                `friction:${index}`,
+                friction.help,
+              )}
+              <input
+                type="number"
+                aria-label="${friction.family} friction threshold at ${Number(speed).toFixed(0)} meters per second"
+                min="${friction.min}"
+                max="${friction.max}"
+                step="${friction.precision}"
+                value="${() => state.customTrialValues?.flmOverrides?.baseFrictionThresholds?.[friction.family]?.values?.[index] ?? ""}"
+                @input="${event => setCustomFrictionValue(index, event.target.value)}" />
+              <small>${friction.min} to ${friction.max}, step ${friction.precision}</small>
+            </div>
+          `)}
+        </div>
+      </div>
+
+      <div class="flmCustomSection">
+        <div class="flmCardHeader">
+          <div>
+            <h4>All Vehicle FLM Controls (${vehicleControls.length})</h4>
+            <p class="longManeuverMuted">Every field is submitted and becomes part of the active custom trial.</p>
+          </div>
+        </div>
+        <div class="flmCustomGrid">
+          ${vehicleControls.map((control) => html`
+            <div class="flmCustomField">
+              ${renderCustomFieldHeading(control.label, `vehicle:${control.key}`, control.help)}
+              <input
+                type="number"
+                aria-label="${control.label}"
+                min="${control.min}"
+                max="${control.max}"
+                step="${control.precision}"
+                value="${() => state.customTrialValues?.flmOverrides?.vehicleKnobs?.[control.key] ?? ""}"
+                @input="${event => setCustomKnobValue(control.key, event.target.value)}" />
+              <small>${control.min} to ${control.max}, step ${control.precision}</small>
+              <code title="${control.key}">${control.key}</code>
+            </div>
+          `)}
+        </div>
+      </div>
+
+      <div class="longManeuverActions">
+        <button
+          class="longManeuverButton"
+          disabled="${() => state.runningAction || state.status?.isOnroad || state.workspace?.activeTrial?.rollbackAvailable === false}"
+          @click="${applyCustomTrial}">
+          Apply Exact Custom Values
+        </button>
+        <button
+          class="longManeuverButton"
+          disabled="${() => state.runningAction || !schema.presets?.recommended}"
+          @click="${() => selectCustomPreset(schema.presets?.recommended ? "recommended" : schema.defaultPreset)}">
+          Reset Form to Recommended
+        </button>
+      </div>
+    </section>
+  `
+}
+
 function renderProfile(profile) {
   const genericEntries = Object.entries(profile.genericParams || {}).filter(([key]) => key !== "AdvancedLateralTune")
   const frictionEntries = Object.entries(profile.flmOverrides?.baseFrictionThresholds || {})
@@ -1223,6 +1614,64 @@ export function Tuning() {
               <button class="longManeuverButton" @click="${clearSelections}">Clear</button>
             </div>
 
+            <div class="flmCardSubsection flmUploadPanel">
+              <h4>Upload rlogs from a comma drive</h4>
+              <p class="longManeuverMuted">
+                Select one or more rlog, rlog.zst, or rlog.bz2 files. Galaxy stores them only in the local FLM workspace and adds the batch below as a selectable route.
+              </p>
+              <div class="flmUploadControls">
+                <input
+                  id="flmRlogFiles"
+                  type="file"
+                  multiple
+                  disabled="${() => state.runningAction || state.status?.isOnroad}"
+                  @change="${setUploadFiles}" />
+                <input
+                  type="text"
+                  maxlength="64"
+                  placeholder="Optional label, e.g. motorway test"
+                  value="${() => state.uploadLabel}"
+                  @input="${event => { state.uploadLabel = event.target.value }}" />
+                <button
+                  class="longManeuverButton"
+                  disabled="${() => state.runningAction || state.status?.isOnroad || state.uploadFiles.length === 0}"
+                  @click="${uploadRlogs}">
+                  Upload ${() => state.uploadFiles.length ? `${state.uploadFiles.length} rlog${state.uploadFiles.length === 1 ? "" : "s"}` : "rlogs"}
+                </button>
+              </div>
+              ${() => state.uploadFiles.length ? html`
+                <small class="longManeuverMuted">
+                  Selected: ${state.uploadFiles.map((file) => file.name).join(", ")} (${formatBytes(state.uploadFiles.reduce((total, file) => total + file.size, 0))})
+                </small>
+              ` : ""}
+              ${() => state.runningAction && state.uploadProgress > 0 ? html`
+                <div class="flmUploadProgress"><span style="width: ${state.uploadProgress}%"></span></div>
+              ` : ""}
+              <div class="flmWorkspaceList">
+                ${() => (state.workspace?.uploads || []).map((upload) => html`
+                  <div class="flmWorkspaceRow">
+                    <label class="flmRouteItem">
+                      <input
+                        type="checkbox"
+                        checked="${() => state.selectedRoutes.includes(upload.routeName)}"
+                        @change="${() => toggleRouteSelection(upload.routeName)}" />
+                      <span>
+                        <strong>${upload.label || "Uploaded rlogs"}</strong>
+                        <small>${upload.fileCount} segment${upload.fileCount === 1 ? "" : "s"} / ${formatBytes(upload.totalBytes)}</small>
+                        <small>${(upload.files || []).map((file) => file.originalFilename).join(", ")}</small>
+                      </span>
+                    </label>
+                    <button
+                      class="longManeuverButton danger flmWorkspaceDelete"
+                      disabled="${() => state.runningAction}"
+                      @click="${() => deleteUploadedRlogs(upload)}">
+                      Delete
+                    </button>
+                  </div>
+                `)}
+              </div>
+            </div>
+
             ${() => state.loadingRoutes ? html`<p class="longManeuverMuted">Loading local routes...</p>` : ""}
             ${() => state.routeTotal ? html`<p class="longManeuverMuted">Route index: ${state.routeProgress}/${state.routeTotal}</p>` : ""}
             ${() => state.truncatedRoutes ? html`<p class="longManeuverMuted">Showing the first ${MAX_RENDERED_ROUTES} routes only.</p>` : ""}
@@ -1423,6 +1872,8 @@ export function Tuning() {
               ${((primaryPath()?.suggestions) || []).map((suggestion) => renderSuggestion(suggestion))}
             </div>
           </section>
+
+          ${() => renderCustomTrialEditor()}
 
           <section class="flmCard">
             <h3>Trial Profiles</h3>

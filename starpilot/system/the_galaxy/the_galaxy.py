@@ -6266,6 +6266,31 @@ def setup(app):
       "status": flm_workspace.read_flm_status(),
     }), 200
 
+  @app.route("/api/flm/uploads", methods=["POST"])
+  def upload_flm_rlogs():
+    if params.get_bool("IsOnroad"):
+      return jsonify({"error": "Rlogs can only be uploaded while the vehicle is offroad."}), 409
+    if request.content_length and request.content_length > flm_workspace.FLM_UPLOAD_MAX_BATCH_BYTES + (8 * 1024 * 1024):
+      return jsonify({"error": "The selected rlog upload is too large for the FLM workspace."}), 413
+    try:
+      return jsonify(flm_workspace.save_uploaded_rlogs(
+        request.files.getlist("files"),
+        str(request.form.get("label") or ""),
+      )), 200
+    except ValueError as error:
+      return jsonify({"error": str(error)}), 400
+    except flm_workspace.FLMAnalysisCancelled as error:
+      return jsonify({"error": str(error)}), 409
+
+  @app.route("/api/flm/uploads/<upload_id>", methods=["DELETE"])
+  def delete_flm_rlogs(upload_id):
+    try:
+      return jsonify(flm_workspace.delete_uploaded_rlogs(upload_id)), 200
+    except FileNotFoundError:
+      return jsonify({"error": "Uploaded rlogs not found."}), 404
+    except RuntimeError as error:
+      return jsonify({"error": str(error)}), 409
+
   @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/report/<report_id>", methods=["GET"])
   @app.route("/api/flm/report/<report_id>", methods=["GET"])
   def get_flm_report(report_id):
@@ -6298,6 +6323,27 @@ def setup(app):
       return jsonify({"error": "FLM report not found."}), 404
     except ValueError as error:
       return jsonify({"error": str(error)}), 400
+
+  @app.route("/api/flm/report/<report_id>/custom-trial", methods=["GET"])
+  def get_flm_custom_trial(report_id):
+    try:
+      return jsonify(flm_workspace.build_custom_trial_schema(report_id)), 200
+    except FileNotFoundError:
+      return jsonify({"error": "FLM report not found."}), 404
+    except RuntimeError as error:
+      return jsonify({"error": str(error)}), 409
+
+  @app.route("/api/flm/report/<report_id>/custom-trial", methods=["POST"])
+  def apply_flm_custom_trial(report_id):
+    data = request.get_json(silent=True) or {}
+    try:
+      return jsonify(flm_workspace.apply_custom_trial(report_id, data)), 200
+    except FileNotFoundError:
+      return jsonify({"error": "FLM report not found."}), 404
+    except ValueError as error:
+      return jsonify({"error": str(error)}), 400
+    except (RuntimeError, flm_workspace.FLMAnalysisCancelled) as error:
+      return jsonify({"error": str(error)}), 409
 
   @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/workspace", methods=["GET"])
   @app.route("/api/flm/workspace", methods=["GET"])
