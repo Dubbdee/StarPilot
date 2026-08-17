@@ -24,7 +24,9 @@ const state = reactive({
   customTrialValues: null,
   customTrialHelpKey: "",
   loadingCustomTrial: false,
-  uploadFiles: [],
+  uploadFileCount: 0,
+  uploadFileNames: [],
+  uploadTotalBytes: 0,
   uploadLabel: "",
   uploadProgress: 0,
   feedbackAccepted: [],
@@ -39,6 +41,7 @@ let flushTimerId = null
 let seenRouteNames = new Set()
 let initialized = false
 let statusPollHandle = null
+let selectedUploadFiles = []
 
 function isTuningRouteActive() {
   return window.location.pathname === "/tuning" || window.location.pathname === "/lateral_maneuvers"
@@ -420,17 +423,23 @@ function clearSelections() {
 }
 
 function setUploadFiles(event) {
-  state.uploadFiles = Array.from(event?.target?.files || [])
+  selectedUploadFiles = Array.from(event?.currentTarget?.files || event?.target?.files || [])
+  state.uploadFileCount = selectedUploadFiles.length
+  state.uploadFileNames = selectedUploadFiles.map((file) => file.name)
+  state.uploadTotalBytes = selectedUploadFiles.reduce((total, file) => total + file.size, 0)
   state.uploadProgress = 0
 }
 
 async function uploadRlogs() {
-  if (!state.uploadFiles.length || state.runningAction || state.status?.isOnroad) return
+  const input = document.getElementById("flmRlogFiles")
+  const currentFiles = Array.from(input?.files || [])
+  if (currentFiles.length) selectedUploadFiles = currentFiles
+  if (!selectedUploadFiles.length || state.runningAction || state.status?.isOnroad) return
   state.runningAction = true
   state.uploadProgress = 0
   try {
     const formData = new FormData()
-    for (const file of state.uploadFiles) formData.append("files", file, file.name)
+    for (const file of selectedUploadFiles) formData.append("files", file, file.name)
     formData.append("label", state.uploadLabel || "")
     const payload = await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
@@ -455,7 +464,10 @@ async function uploadRlogs() {
     if (payload.upload?.routeName && !state.selectedRoutes.includes(payload.upload.routeName)) {
       state.selectedRoutes = [...state.selectedRoutes, payload.upload.routeName]
     }
-    state.uploadFiles = []
+    selectedUploadFiles = []
+    state.uploadFileCount = 0
+    state.uploadFileNames = []
+    state.uploadTotalBytes = 0
     state.uploadLabel = ""
     state.uploadProgress = 100
     const input = document.getElementById("flmRlogFiles")
@@ -1633,7 +1645,7 @@ export function Tuning() {
                   id="flmRlogFiles"
                   type="file"
                   multiple
-                  disabled="${() => state.runningAction || state.status?.isOnroad}"
+                  disabled="${() => state.runningAction}"
                   @change="${setUploadFiles}" />
                 <input
                   type="text"
@@ -1643,14 +1655,14 @@ export function Tuning() {
                   @input="${event => { state.uploadLabel = event.target.value }}" />
                 <button
                   class="longManeuverButton"
-                  disabled="${() => state.runningAction || state.status?.isOnroad || state.uploadFiles.length === 0}"
+                  disabled="${() => state.runningAction || state.status?.isOnroad || state.uploadFileCount === 0}"
                   @click="${uploadRlogs}">
-                  Upload ${() => state.uploadFiles.length ? `${state.uploadFiles.length} rlog${state.uploadFiles.length === 1 ? "" : "s"}` : "rlogs"}
+                  Upload ${() => state.uploadFileCount ? `${state.uploadFileCount} rlog${state.uploadFileCount === 1 ? "" : "s"}` : "rlogs"}
                 </button>
               </div>
-              ${() => state.uploadFiles.length ? html`
+              ${() => state.uploadFileCount ? html`
                 <small class="longManeuverMuted">
-                  Selected: ${state.uploadFiles.map((file) => file.name).join(", ")} (${formatBytes(state.uploadFiles.reduce((total, file) => total + file.size, 0))})
+                  Selected: ${state.uploadFileNames.join(", ")} (${formatBytes(state.uploadTotalBytes)})
                 </small>
               ` : ""}
               ${() => state.runningAction && state.uploadProgress > 0 ? html`

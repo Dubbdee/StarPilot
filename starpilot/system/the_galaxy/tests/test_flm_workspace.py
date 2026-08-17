@@ -351,7 +351,7 @@ def test_segment_range_rejects_reversed_bounds(tmp_path):
 def test_uploaded_rlogs_are_saved_listed_and_resolved(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
   uploaded = [
-    SimpleNamespace(filename="first.rlog", stream=BytesIO(b"first-log")),
+    SimpleNamespace(filename="75427c8aa7a74ffd_00000082--0cd28f991c--0--rlog", stream=BytesIO(b"first-log")),
     SimpleNamespace(filename="second.rlog", stream=BytesIO(b"second-log")),
   ]
 
@@ -363,6 +363,7 @@ def test_uploaded_rlogs_are_saved_listed_and_resolved(tmp_path):
   assert len(listed) == 1
   assert listed[0]["label"] == "Motorway test"
   assert listed[0]["fileCount"] == 2
+  assert listed[0]["files"][0]["originalFilename"].endswith("--rlog")
   assert [source.segment_num for source in sources] == [0, 1]
   assert all(Path(source.log_path).name == "rlog" for source in sources)
   assert warnings == []

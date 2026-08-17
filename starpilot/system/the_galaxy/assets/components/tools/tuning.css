@@ -10,6 +10,7 @@
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--border-radius-md);
   margin-top: var(--margin-base);
+  min-width: 0;
   padding: var(--padding-base);
 }
 
@@ -388,6 +389,7 @@
   background: rgba(255, 255, 255, 0.025);
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: var(--border-radius-sm);
+  min-width: 0;
   padding: var(--padding-sm);
 }
 
@@ -398,7 +400,12 @@
 .flmUploadControls {
   display: grid;
   gap: var(--gap-xs);
-  grid-template-columns: minmax(12rem, 1.5fr) minmax(12rem, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+}
+
+.flmUploadControls input[type="file"] {
+  grid-column: 1 / -1;
 }
 
 .flmUploadControls input[type="file"],
@@ -407,9 +414,22 @@
   background: var(--input-bg);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: var(--border-radius-sm);
+  box-sizing: border-box;
   color: var(--text-color);
+  max-width: 100%;
   min-width: 0;
   padding: var(--padding-sm);
+  width: 100%;
+}
+
+.flmUploadControls .longManeuverButton {
+  max-width: 100%;
+  white-space: nowrap;
+}
+
+.flmUploadPanel > small {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .flmUploadProgress {

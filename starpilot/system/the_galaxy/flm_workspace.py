@@ -611,9 +611,9 @@ def _uploaded_log_target_name(filename: str) -> tuple[str, bytes | None]:
     return "rlog.zst", b"\x28\xb5\x2f\xfd"
   if safe_name.endswith(".bz2"):
     return "rlog.bz2", b"BZh"
-  if safe_name == "rlog" or safe_name.endswith(".rlog"):
+  if safe_name == "rlog" or safe_name.endswith((".rlog", "--rlog")):
     return "rlog", None
-  raise ValueError(f"{Path(safe_name).name}: expected an rlog, .rlog, .zst, or .bz2 file.")
+  raise ValueError(f"{Path(safe_name).name}: expected an rlog, --rlog, .rlog, .zst, or .bz2 file.")
 
 
 def _copy_uploaded_log(uploaded_file, destination: Path, expected_magic: bytes | None,
