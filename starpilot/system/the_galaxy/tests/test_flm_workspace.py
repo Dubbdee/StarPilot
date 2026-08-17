@@ -372,6 +372,42 @@ def test_uploaded_rlogs_are_saved_listed_and_resolved(tmp_path):
   assert module.list_uploaded_rlogs() == []
 
 
+def test_uploaded_rlogs_preserve_segment_numbers_and_ranges(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  uploaded = [
+    SimpleNamespace(filename="route--14--rlog", stream=BytesIO(b"fourteen")),
+    SimpleNamespace(filename="route--2--rlog", stream=BytesIO(b"two")),
+    SimpleNamespace(filename="route--0--rlog", stream=BytesIO(b"zero")),
+  ]
+
+  result = module.save_uploaded_rlogs(uploaded, "Whole route")
+  route_name = result["upload"]["routeName"]
+  listed = result["workspace"]["uploads"][0]
+  sources, warnings = module.resolve_route_sources(
+    [route_name],
+    [str(tmp_path)],
+    {route_name: {"start": 2, "end": 14}},
+  )
+
+  assert listed["firstSegment"] == 0
+  assert listed["lastSegment"] == 14
+  assert [item["segment"] for item in listed["files"]] == [0, 2, 14]
+  assert [source.segment_num for source in sources] == [2, 14]
+  assert warnings == []
+
+
+def test_uploaded_rlogs_reject_duplicate_segment_numbers(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  uploaded = [
+    SimpleNamespace(filename="route--3--rlog", stream=BytesIO(b"raw")),
+    SimpleNamespace(filename="other-route--3--rlog", stream=BytesIO(b"duplicate")),
+  ]
+
+  with pytest.raises(ValueError, match="only one rlog for segment 3"):
+    module.save_uploaded_rlogs(uploaded, "Duplicate")
+  assert module.list_uploaded_rlogs() == []
+
+
 def test_uploaded_rlogs_reject_wrong_compression_and_oversized_files(tmp_path, monkeypatch):
   module, _ = _load_flm_workspace_module(tmp_path)
   with pytest.raises(ValueError, match="compression format"):

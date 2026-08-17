@@ -491,6 +491,8 @@ async function deleteUploadedRlogs(upload) {
     if (!response.ok) throw new Error(payload.error || "Failed to delete uploaded rlogs.")
     state.workspace = payload.workspace || state.workspace
     state.selectedRoutes = state.selectedRoutes.filter((route) => route !== upload.routeName)
+    const { [upload.routeName]: _deletedRange, ...remainingRanges } = state.segmentRanges
+    state.segmentRanges = remainingRanges
     showSnackbar(payload.message || "Uploaded rlogs deleted.")
   } catch (error) {
     state.error = error?.message || "Failed to delete uploaded rlogs."
@@ -1023,7 +1025,7 @@ function comparisonValueChanged(row) {
 }
 
 function renderTuneComparison() {
-  const rows = tuneComparisonRows()
+  const rows = tuneComparisonRows().filter(comparisonValueChanged)
   if (!rows.length) return ""
   const profile = activeTrialProfile()
   const angleControl = state.report?.car?.controlPath === "angle"
@@ -1670,24 +1672,51 @@ export function Tuning() {
               ` : ""}
               <div class="flmWorkspaceList">
                 ${() => (state.workspace?.uploads || []).map((upload) => html`
-                  <div class="flmWorkspaceRow">
-                    <label class="flmRouteItem">
-                      <input
-                        type="checkbox"
-                        checked="${() => state.selectedRoutes.includes(upload.routeName)}"
-                        @change="${() => toggleRouteSelection(upload.routeName)}" />
-                      <span>
-                        <strong>${upload.label || "Uploaded rlogs"}</strong>
-                        <small>${upload.fileCount} segment${upload.fileCount === 1 ? "" : "s"} / ${formatBytes(upload.totalBytes)}</small>
-                        <small>${(upload.files || []).map((file) => file.originalFilename).join(", ")}</small>
-                      </span>
-                    </label>
-                    <button
-                      class="longManeuverButton danger flmWorkspaceDelete"
-                      disabled="${() => state.runningAction}"
-                      @click="${() => deleteUploadedRlogs(upload)}">
-                      Delete
-                    </button>
+                  <div class="flmRouteSelection">
+                    <div class="flmWorkspaceRow">
+                      <label class="flmRouteItem">
+                        <input
+                          type="checkbox"
+                          checked="${() => state.selectedRoutes.includes(upload.routeName)}"
+                          @change="${() => toggleRouteSelection(upload.routeName)}" />
+                        <span>
+                          <strong>${upload.label || "Uploaded rlogs"}</strong>
+                          <small>
+                            ${upload.fileCount} segment${upload.fileCount === 1 ? "" : "s"}
+                            ${upload.firstSegment == null ? "" : ` (${upload.firstSegment}-${upload.lastSegment})`} /
+                            ${formatBytes(upload.totalBytes)}
+                          </small>
+                          <small>${(upload.files || []).map((file) => file.originalFilename).join(", ")}</small>
+                        </span>
+                      </label>
+                      <button
+                        class="longManeuverButton danger flmWorkspaceDelete"
+                        disabled="${() => state.runningAction}"
+                        @click="${() => deleteUploadedRlogs(upload)}">
+                        Delete
+                      </button>
+                    </div>
+                    ${() => state.selectedRoutes.includes(upload.routeName) ? html`
+                      <div class="flmSegmentRange">
+                        <span>Segments</span>
+                        <input
+                          type="number"
+                          min="0"
+                          inputmode="numeric"
+                          placeholder="First"
+                          value="${() => state.segmentRanges[upload.routeName]?.start ?? ""}"
+                          @input="${event => setSegmentRange(upload.routeName, "start", event.target.value)}" />
+                        <span>to</span>
+                        <input
+                          type="number"
+                          min="0"
+                          inputmode="numeric"
+                          placeholder="Last"
+                          value="${() => state.segmentRanges[upload.routeName]?.end ?? ""}"
+                          @input="${event => setSegmentRange(upload.routeName, "end", event.target.value)}" />
+                        <small>Blank analyzes the whole uploaded route.</small>
+                      </div>
+                    ` : ""}
                   </div>
                 `)}
               </div>
@@ -1728,7 +1757,7 @@ export function Tuning() {
                         min="0"
                         inputmode="numeric"
                         placeholder="First"
-                        value="${() => state.segmentRanges[route.name]?.start || ""}"
+                        value="${() => state.segmentRanges[route.name]?.start ?? ""}"
                         @input="${event => setSegmentRange(route.name, "start", event.target.value)}" />
                       <span>to</span>
                       <input
@@ -1736,7 +1765,7 @@ export function Tuning() {
                         min="0"
                         inputmode="numeric"
                         placeholder="Last"
-                        value="${() => state.segmentRanges[route.name]?.end || ""}"
+                        value="${() => state.segmentRanges[route.name]?.end ?? ""}"
                         @input="${event => setSegmentRange(route.name, "end", event.target.value)}" />
                       <small>Blank analyzes the whole route.</small>
                     </div>

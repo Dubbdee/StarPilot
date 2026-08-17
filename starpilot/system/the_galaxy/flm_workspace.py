@@ -55,6 +55,7 @@ FLM_UPLOAD_MAX_FILE_BYTES = 512 * 1024 * 1024
 FLM_UPLOAD_MAX_BATCH_BYTES = 2 * 1024 * 1024 * 1024
 FLM_UPLOAD_CHUNK_BYTES = 1024 * 1024
 FLM_UPLOAD_ID_PATTERN = re.compile(r"^[0-9]{10}-[0-9a-f]{8}$")
+FLM_UPLOAD_SEGMENT_PATTERN = re.compile(r"--(?P<segment>[0-9]+)--rlog(?:\.(?:zst|bz2))?$", re.IGNORECASE)
 
 
 class FLMAnalysisCancelled(RuntimeError):
@@ -616,6 +617,11 @@ def _uploaded_log_target_name(filename: str) -> tuple[str, bytes | None]:
   raise ValueError(f"{Path(safe_name).name}: expected an rlog, --rlog, .rlog, .zst, or .bz2 file.")
 
 
+def _uploaded_log_segment_number(filename: str) -> int | None:
+  match = FLM_UPLOAD_SEGMENT_PATTERN.search(Path(str(filename or "")).name)
+  return int(match.group("segment")) if match else None
+
+
 def _copy_uploaded_log(uploaded_file, destination: Path, expected_magic: bytes | None,
                        max_bytes: int) -> int:
   stream = getattr(uploaded_file, "stream", uploaded_file)
@@ -663,10 +669,32 @@ def save_uploaded_rlogs(uploaded_files, label: str = "") -> dict[str, Any]:
   manifest_files = []
   total_bytes = 0
   try:
-    for index, uploaded_file in enumerate(files):
+    prepared_files = []
+    explicit_segments = set()
+    for uploaded_file in files:
       original_name = Path(str(getattr(uploaded_file, "filename", "") or "")).name
       target_name, expected_magic = _uploaded_log_target_name(original_name)
-      segment_name = f"{upload_id}--{index}"
+      segment_num = _uploaded_log_segment_number(original_name)
+      if segment_num is not None and segment_num in explicit_segments:
+        raise ValueError(f"Select only one rlog for segment {segment_num}.")
+      if segment_num is not None:
+        explicit_segments.add(segment_num)
+      prepared_files.append((uploaded_file, original_name, target_name, expected_magic, segment_num))
+
+    next_fallback_segment = 0
+    normalized_files = []
+    used_segments = set(explicit_segments)
+    for uploaded_file, original_name, target_name, expected_magic, segment_num in prepared_files:
+      if segment_num is None:
+        while next_fallback_segment in used_segments:
+          next_fallback_segment += 1
+        segment_num = next_fallback_segment
+        used_segments.add(segment_num)
+        next_fallback_segment += 1
+      normalized_files.append((segment_num, uploaded_file, original_name, target_name, expected_magic))
+
+    for segment_num, uploaded_file, original_name, target_name, expected_magic in sorted(normalized_files):
+      segment_name = f"{upload_id}--{segment_num}"
       relative_path = Path(segment_name) / target_name
       file_size = _copy_uploaded_log(
         uploaded_file,
@@ -676,7 +704,7 @@ def save_uploaded_rlogs(uploaded_files, label: str = "") -> dict[str, Any]:
       )
       total_bytes += file_size
       manifest_files.append({
-        "segment": index,
+        "segment": segment_num,
         "segmentName": segment_name,
         "originalFilename": original_name or target_name,
         "storedPath": relative_path.as_posix(),
@@ -713,6 +741,10 @@ def list_uploaded_rlogs(paths: dict[str, Path] | None = None) -> list[dict[str, 
     if not isinstance(manifest, dict) or not FLM_UPLOAD_ID_PATTERN.fullmatch(upload_id):
       continue
     files = [item for item in manifest.get("files", []) if isinstance(item, dict)]
+    segment_numbers = [
+      int(item["segment"]) if item.get("segment") is not None else index
+      for index, item in enumerate(files)
+    ]
     uploads.append({
       "uploadId": upload_id,
       "routeName": f"{FLM_UPLOAD_ROUTE_PREFIX}{upload_id}",
@@ -720,8 +752,10 @@ def list_uploaded_rlogs(paths: dict[str, Path] | None = None) -> list[dict[str, 
       "createdAt": float(manifest.get("createdAt", manifest_path.stat().st_mtime) or manifest_path.stat().st_mtime),
       "totalBytes": int(manifest.get("totalBytes", sum(int(item.get("sizeBytes", 0) or 0) for item in files)) or 0),
       "fileCount": len(files),
+      "firstSegment": min(segment_numbers) if segment_numbers else None,
+      "lastSegment": max(segment_numbers) if segment_numbers else None,
       "files": [{
-        "segment": int(item.get("segment", index) or index),
+        "segment": int(item["segment"]) if item.get("segment") is not None else index,
         "originalFilename": str(item.get("originalFilename", "rlog") or "rlog"),
         "sizeBytes": int(item.get("sizeBytes", 0) or 0),
       } for index, item in enumerate(files)],
@@ -763,7 +797,7 @@ def _resolve_uploaded_route_sources(route: str, segment_range: dict[str, int | N
   for index, item in enumerate(manifest.get("files", [])):
     if not isinstance(item, dict):
       continue
-    segment_num = int(item.get("segment", index) or index)
+    segment_num = int(item["segment"]) if item.get("segment") is not None else index
     if segment_start is not None and segment_num < segment_start:
       continue
     if segment_end is not None and segment_num > segment_end:
