@@ -157,6 +157,21 @@ def _install_flm_import_stubs(tmp_path):
     "openpilot.starpilot.common.lateral_delay",
     full_lateral_delay=lambda value: float(value) + 0.2,
   )
+
+  def live_flm_runtime_update_path(shm_path):
+    return Path(shm_path) / "flm_live_runtime_update.json"
+
+  def clear_live_flm_runtime_update(path):
+    try:
+      Path(path).unlink()
+    except FileNotFoundError:
+      pass
+
+  sys.modules["openpilot.starpilot.common.live_flm_runtime"] = _simple_module(
+    "openpilot.starpilot.common.live_flm_runtime",
+    clear_live_flm_runtime_update=clear_live_flm_runtime_update,
+    live_flm_runtime_update_path=live_flm_runtime_update_path,
+  )
   galaxy_utilities = _simple_module(
     "openpilot.starpilot.system.the_galaxy.utilities",
     get_segments_in_route=lambda route, footage_path: [],
@@ -231,6 +246,18 @@ def test_live_sample_window_trim_is_in_place_and_bounded(monkeypatch, tmp_path):
   assert [sample.t for sample in samples] == [1.0, 1.5, 2.0]
 
 
+def test_live_sample_gate_limits_message_processing_to_twenty_hz(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+
+  assert module.FLM_LIVE_SAMPLE_RATE_HZ == pytest.approx(20.0)
+  assert module._live_sample_due(10.0, None) is True
+  assert module._live_sample_due(10.049, 10.0) is False
+  assert module._live_sample_due(10.051, 10.0) is True
+  assert module._live_loop_sleep_seconds(10.0, 10.01) == pytest.approx(0.04)
+  assert module._live_loop_sleep_seconds(10.0, 10.051) == 0.0
+  assert module.FLM_LIVE_MAX_BUFFER_SAMPLES < 2000
+
+
 def test_live_service_health_identifies_required_invalid_publisher(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
   healthy = {service: True for service in module.FLM_LIVE_REQUIRED_SERVICES}
@@ -244,6 +271,64 @@ def test_live_service_health_identifies_required_invalid_publisher(tmp_path):
   ready, faults = module._live_service_health(sm)
   assert ready is False
   assert faults == ["liveTorqueParameters:invalid"]
+
+
+def test_live_health_guard_times_out_before_arming(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+
+  assert module._live_health_failure_kind(False, 10.0, 0.0, 14.99) == ""
+  assert module._live_health_failure_kind(False, 10.0, 0.0, 15.0) == "startup"
+  assert module._live_health_failure_kind(True, 10.0, 20.0, 21.24) == ""
+  assert module._live_health_failure_kind(True, 10.0, 20.0, 21.25) == "runtime"
+
+
+def test_live_worker_uses_low_rate_subscriber_and_reverts_unhealthy_startup(monkeypatch, tmp_path):
+  module, fake_params_cls = _load_flm_workspace_module(tmp_path)
+  module.FLM_LIVE_STATUS_PATH = tmp_path / "live_status.json"
+  session_id = "live-test-session"
+  module._write_json(module._live_baseline_path(), {
+    "sessionId": session_id,
+    "startingTuneLabel": "Test tune",
+  })
+  fake_params_cls._store = {"IsOnroad": True}
+
+  constructor_kwargs = {}
+
+  class FakeSubMaster:
+    def __init__(self, services, **kwargs):
+      constructor_kwargs.update(kwargs)
+      self.seen = dict.fromkeys(services, False)
+      self.valid = dict.fromkeys(services, False)
+      self.alive = dict.fromkeys(services, False)
+      self.freq_ok = dict.fromkeys(services, False)
+      self.updated = dict.fromkeys(services, False)
+
+    @staticmethod
+    def update(_timeout):
+      pass
+
+  monkeypatch.setattr(
+    sys.modules["cereal"],
+    "messaging",
+    SimpleNamespace(SubMaster=FakeSubMaster),
+    raising=False,
+  )
+  restored = []
+  monkeypatch.setattr(module, "_restore_live_flm_baseline", lambda *_args, **kwargs: restored.append(kwargs["reason"]))
+
+  clock = SimpleNamespace(now=100.0)
+  monkeypatch.setattr(module.time, "monotonic", lambda: clock.now)
+  monkeypatch.setattr(module.time, "sleep", lambda seconds: setattr(clock, "now", clock.now + seconds))
+
+  module.run_live_worker(session_id)
+
+  status = module.read_live_flm_status()
+  assert constructor_kwargs == {"frequency": module.FLM_LIVE_SAMPLE_RATE_HZ}
+  assert restored == ["health-guard"]
+  assert status["running"] is False
+  assert status["state"] == "safety_reverted"
+  assert status["healthFailureKind"] == "startup"
+  assert status["healthArmed"] is False
 
 
 def test_standard_toggle_reload_clears_live_runtime_overlay(tmp_path):

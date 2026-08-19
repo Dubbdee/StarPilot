@@ -61,8 +61,11 @@ FLM_LIVE_MAX_WINDOW_SECONDS = 90.0
 FLM_LIVE_EVALUATION_INTERVAL_SECONDS = 10.0
 FLM_LIVE_STATUS_INTERVAL_SECONDS = 1.0
 FLM_LIVE_MIN_ELIGIBLE_SAMPLES = 500
-FLM_LIVE_MAX_BUFFER_SAMPLES = int(FLM_LIVE_MAX_WINDOW_SECONDS * 110)
+FLM_LIVE_SAMPLE_RATE_HZ = 20.0
+FLM_LIVE_SAMPLE_INTERVAL_SECONDS = 1.0 / FLM_LIVE_SAMPLE_RATE_HZ
+FLM_LIVE_MAX_BUFFER_SAMPLES = int(math.ceil(FLM_LIVE_MAX_WINDOW_SECONDS * FLM_LIVE_SAMPLE_RATE_HZ)) + 2
 FLM_LIVE_HEALTH_ARM_SECONDS = 2.0
+FLM_LIVE_HEALTH_STARTUP_TIMEOUT_SECONDS = 5.0
 FLM_LIVE_HEALTH_FAILURE_SECONDS = 1.25
 FLM_LIVE_SLOW_EVALUATION_SECONDS = 1.5
 FLM_LIVE_SLOW_EVALUATION_COOLDOWN_SECONDS = 30.0
@@ -3041,6 +3044,14 @@ def _trim_live_samples(samples: deque[FLMSample], newest_time: float) -> int:
   return removed
 
 
+def _live_sample_due(monotonic_now: float, last_sample_at: float | None) -> bool:
+  return last_sample_at is None or monotonic_now - last_sample_at >= FLM_LIVE_SAMPLE_INTERVAL_SECONDS
+
+
+def _live_loop_sleep_seconds(iteration_started: float, monotonic_now: float) -> float:
+  return max(FLM_LIVE_SAMPLE_INTERVAL_SECONDS - (monotonic_now - iteration_started), 0.0)
+
+
 def _live_service_health(sm) -> tuple[bool, list[str]]:
   seen = getattr(sm, "seen", {})
   valid = getattr(sm, "valid", {})
@@ -3060,6 +3071,17 @@ def _live_service_health(sm) -> tuple[bool, list[str]]:
       faults.append(f"{service}:frequency")
 
   return not faults, faults
+
+
+def _live_health_failure_kind(health_armed: bool, health_wait_started: float | None,
+                              health_fault_since: float, monotonic_now: float) -> str:
+  if health_armed:
+    if health_fault_since > 0.0 and monotonic_now - health_fault_since >= FLM_LIVE_HEALTH_FAILURE_SECONDS:
+      return "runtime"
+    return ""
+  if health_wait_started is not None and monotonic_now - health_wait_started >= FLM_LIVE_HEALTH_STARTUP_TIMEOUT_SECONDS:
+    return "startup"
+  return ""
 
 
 def _build_live_adjustment_plan(samples: list[FLMSample], car_params, params: Params,
@@ -5327,7 +5349,9 @@ def run_live_worker(session_id: str) -> None:
   evaluation_cooldown_until = 0.0
   last_evaluation_duration_ms = 0.0
   max_evaluation_duration_ms = 0.0
+  last_sample_at: float | None = None
   health_armed = False
+  health_wait_started = time.monotonic() if onroad else None
   health_good_since = 0.0
   health_fault_since = 0.0
   health_faults: list[str] = []
@@ -5348,9 +5372,12 @@ def run_live_worker(session_id: str) -> None:
   try:
     sm = messaging.SubMaster(
       ["controlsState", "carState", "carControl", "carOutput", "liveParameters", "liveTorqueParameters", "carParams"],
-      poll="controlsState",
+      # Read conflated latest-value messages at the same rate used by the FLM
+      # evidence sampler instead of waking this low-priority worker at 100 Hz.
+      frequency=FLM_LIVE_SAMPLE_RATE_HZ,
     )
     while True:
+      iteration_started = time.monotonic()
       sm.update(100)
       monotonic_now = time.monotonic()
 
@@ -5366,7 +5393,9 @@ def run_live_worker(session_id: str) -> None:
         pending_plan = None
         collect_after = 0.0
         evaluation_cooldown_until = 0.0
+        last_sample_at = None
         health_armed = False
+        health_wait_started = None
         health_good_since = 0.0
         health_fault_since = 0.0
         health_faults = []
@@ -5374,6 +5403,8 @@ def run_live_worker(session_id: str) -> None:
         state = "waiting_onroad"
         message = "Waiting for the vehicle to go onroad."
       else:
+        if health_wait_started is None:
+          health_wait_started = monotonic_now
         services_healthy, health_faults = _live_service_health(sm)
         if services_healthy:
           health_fault_since = 0.0
@@ -5386,8 +5417,19 @@ def run_live_worker(session_id: str) -> None:
           if health_armed and health_fault_since <= 0.0:
             health_fault_since = monotonic_now
 
-        if health_armed and health_fault_since > 0.0 and monotonic_now - health_fault_since >= FLM_LIVE_HEALTH_FAILURE_SECONDS:
+        health_failure_kind = _live_health_failure_kind(
+          health_armed,
+          health_wait_started,
+          health_fault_since,
+          monotonic_now,
+        )
+        if health_failure_kind:
           fault_summary = ", ".join(health_faults) or "required onroad messages"
+          if health_failure_kind == "startup":
+            failure_message = f"required onroad processes did not remain healthy for {FLM_LIVE_HEALTH_ARM_SECONDS:.0f} continuous seconds "
+            failure_message += f"within {FLM_LIVE_HEALTH_STARTUP_TIMEOUT_SECONDS:.0f} seconds ({fault_summary})"
+          else:
+            failure_message = f"{fault_summary} became unhealthy"
           _restore_live_flm_baseline(paths, baseline, params, reason="health-guard")
           _write_live_flm_status({
             "pid": 0,
@@ -5395,13 +5437,14 @@ def run_live_worker(session_id: str) -> None:
             "startedAt": started_at,
             "running": False,
             "state": "safety_reverted",
-            "message": f"Live FLM stopped and restored the pre-live tune because {fault_summary} became unhealthy.",
+            "message": f"Live FLM stopped and restored the pre-live tune because {failure_message}.",
             "adjustmentCount": adjustment_count,
             "sampleCount": 0,
             "eligibleSampleCount": 0,
             "windowSeconds": 0.0,
             "changeLog": list(change_log),
-            "healthArmed": True,
+            "healthArmed": health_armed,
+            "healthFailureKind": health_failure_kind,
             "healthFaults": health_faults,
             "lastEvaluationDurationMs": last_evaluation_duration_ms,
             "maxEvaluationDurationMs": max_evaluation_duration_ms,
@@ -5418,13 +5461,18 @@ def run_live_worker(session_id: str) -> None:
           samples.clear()
           pending_plan = None
           collect_after = 0.0
+          last_sample_at = None
           if services_healthy:
             state = "arming_health_guard"
             message = "Verifying stable onroad processes before collecting Live FLM evidence."
           else:
             state = "waiting_for_healthy_processes"
             message = "Waiting for required onroad processes before collecting Live FLM evidence."
-        elif bool(getattr(sm, "updated", {}).get("controlsState", False)):
+        elif (
+          bool(getattr(sm, "updated", {}).get("controlsState", False))
+          and _live_sample_due(monotonic_now, last_sample_at)
+        ):
+          last_sample_at = monotonic_now
           if not was_onroad:
             samples.clear()
           was_onroad = True
@@ -5576,11 +5624,15 @@ def run_live_worker(session_id: str) -> None:
           "lastEvaluationDurationMs": round(last_evaluation_duration_ms, 1),
           "maxEvaluationDurationMs": round(max_evaluation_duration_ms, 1),
           "evaluationCooldownSeconds": round(max(evaluation_cooldown_until - monotonic_now, 0.0), 1),
+          "sampleRateHz": FLM_LIVE_SAMPLE_RATE_HZ,
           "bufferCapacity": FLM_LIVE_MAX_BUFFER_SAMPLES,
           "canResume": False,
           "canRevert": True,
         })
         last_status_write = monotonic_now
+      sleep_seconds = _live_loop_sleep_seconds(iteration_started, time.monotonic())
+      if sleep_seconds > 0.0:
+        time.sleep(sleep_seconds)
   except Exception as error:
     status = read_live_flm_status()
     restored = False
