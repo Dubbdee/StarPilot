@@ -31,6 +31,124 @@
   margin-top: var(--margin-base);
 }
 
+.flmLiveActions {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  gap: var(--gap-xs);
+  justify-content: flex-end;
+}
+
+.flmLiveStatusGrid {
+  margin-top: var(--margin-base);
+}
+
+.flmLiveGraph,
+.flmLiveChangeLog {
+  background: rgba(0, 0, 0, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--border-radius-sm);
+  padding: var(--padding-sm);
+}
+
+.flmLiveGraph h4,
+.flmLiveChangeLog h4 {
+  margin: 0 0 var(--margin-sm);
+}
+
+.flmLiveGraphHeader {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: var(--font-size-xs);
+  gap: var(--gap-sm);
+  margin-bottom: var(--margin-xs);
+}
+
+.flmLiveGraphHeader span {
+  align-items: center;
+  display: inline-flex;
+  gap: 0.35rem;
+}
+
+.flmLiveLegend {
+  border-radius: 999px;
+  display: inline-block;
+  height: 0.22rem;
+  width: 1.5rem;
+}
+
+.flmLiveLegend.desired,
+.flmLiveGraphLine.desired {
+  background: #a77cf4;
+  stroke: #a77cf4;
+}
+
+.flmLiveLegend.actual,
+.flmLiveGraphLine.actual {
+  background: #49d4c5;
+  stroke: #49d4c5;
+}
+
+.flmLiveGraphSvg {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: var(--border-radius-sm);
+  display: block;
+  height: auto;
+  max-height: 13rem;
+  width: 100%;
+}
+
+.flmLiveGraphLine {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.flmLiveGraphZero {
+  stroke: rgba(255, 255, 255, 0.2);
+  stroke-dasharray: 5 5;
+  stroke-width: 1;
+}
+
+.flmLiveGraphEmpty {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: center;
+  min-height: 7rem;
+  text-align: center;
+}
+
+.flmLiveChangeLines {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 13rem;
+  overflow: auto;
+}
+
+.flmLiveChangeLine {
+  align-items: baseline;
+  display: grid;
+  font-size: var(--font-size-xs);
+  gap: var(--gap-xs);
+  grid-template-columns: auto auto minmax(0, 1fr);
+}
+
+.flmLiveChangeLine time,
+.flmLiveChangeLine span {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.flmLiveChangeLine code {
+  color: var(--text-color);
+  overflow-wrap: anywhere;
+}
+
 .flmRouteList,
 .flmWorkspaceList,
 .flmFindings {
@@ -595,5 +713,22 @@
 
   .flmUploadControls {
     grid-template-columns: 1fr;
+  }
+
+  .flmLiveCard .flmCardHeader {
+    flex-direction: column;
+  }
+
+  .flmLiveActions {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .flmLiveChangeLine {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .flmLiveChangeLine code {
+    grid-column: 1 / -1;
   }
 }

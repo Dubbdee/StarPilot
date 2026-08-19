@@ -42,13 +42,23 @@ from openpilot.starpilot.system.the_galaxy import utilities
 
 FLM_STATUS_PATH = Path("/tmp/galaxy_flm_status.json")
 FLM_LOG_PATH = Path("/tmp/galaxy_flm.log")
+FLM_LIVE_STATUS_PATH = Path("/tmp/galaxy_flm_live_status.json")
+FLM_LIVE_LOG_PATH = Path("/tmp/galaxy_flm_live.log")
 FLM_STATUS_MAX_AGE_SECONDS = 3600.0
 FLM_ANALYZER_ROUTE_LIMIT = 8
 FLM_ANALYZER_PROCESS = None
 FLM_ANALYZER_LOCK = threading.Lock()
+FLM_LIVE_PROCESS = None
+FLM_LIVE_LOCK = threading.Lock()
 FLM_PROGRESS_FILENAME = "progress.json"
+FLM_LIVE_BASELINE_FILENAME = "live_baseline.json"
 FLM_ONROAD_POLL_INTERVAL_SECONDS = 0.25
 FLM_SEGMENT_TIMEOUT_SECONDS = 60.0
+FLM_LIVE_MIN_WINDOW_SECONDS = 30.0
+FLM_LIVE_MAX_WINDOW_SECONDS = 90.0
+FLM_LIVE_EVALUATION_INTERVAL_SECONDS = 10.0
+FLM_LIVE_STATUS_INTERVAL_SECONDS = 1.0
+FLM_LIVE_MIN_ELIGIBLE_SAMPLES = 500
 FLM_UPLOAD_ROUTE_PREFIX = "upload:"
 FLM_UPLOAD_MAX_FILES = 64
 FLM_UPLOAD_MAX_FILE_BYTES = 512 * 1024 * 1024
@@ -443,6 +453,86 @@ def clear_flm_status() -> None:
     pass
   except OSError:
     pass
+
+
+def read_live_flm_status() -> dict[str, Any]:
+  data = _read_json(FLM_LIVE_STATUS_PATH, {})
+  return data if isinstance(data, dict) else {}
+
+
+def _write_live_flm_status(payload: dict[str, Any]) -> None:
+  payload = dict(payload)
+  payload["updatedAt"] = time.time()
+  tmp_path = FLM_LIVE_STATUS_PATH.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+  try:
+    tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp_path.replace(FLM_LIVE_STATUS_PATH)
+  finally:
+    try:
+      tmp_path.unlink()
+    except FileNotFoundError:
+      pass
+
+
+def clear_live_flm_status() -> None:
+  try:
+    FLM_LIVE_STATUS_PATH.unlink()
+  except FileNotFoundError:
+    pass
+  except OSError:
+    pass
+
+
+def _live_baseline_path(paths: dict[str, Path] | None = None) -> Path:
+  paths = paths or ensure_flm_workspace()
+  return paths["root"] / FLM_LIVE_BASELINE_FILENAME
+
+
+def _live_flm_pid_matches(pid: int, status: dict[str, Any]) -> bool:
+  cmdline_path = Path(f"/proc/{pid}/cmdline")
+  if not cmdline_path.exists():
+    return True
+  try:
+    command = cmdline_path.read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+  except OSError:
+    return True
+  session_id = str(status.get("sessionId", "") or "")
+  return "flm_workspace.py" in command and "live-worker" in command and (not session_id or session_id in command)
+
+
+def live_flm_running() -> bool:
+  process = FLM_LIVE_PROCESS
+  if process is not None and process.poll() is None:
+    return True
+
+  status = read_live_flm_status()
+  pid = int(status.get("pid") or 0)
+  if pid <= 0 or not status.get("running"):
+    return False
+  try:
+    os.kill(pid, 0)
+  except ProcessLookupError:
+    _write_live_flm_status({**status, "pid": 0, "running": False, "state": "stopped"})
+    return False
+  except PermissionError:
+    return True
+  except OSError:
+    return False
+  if not _live_flm_pid_matches(pid, status):
+    _write_live_flm_status({**status, "pid": 0, "running": False, "state": "stopped"})
+    return False
+  return True
+
+
+def _require_live_flm_stopped() -> None:
+  if live_flm_running():
+    raise RuntimeError("Stop Live FLM before changing or replacing the active tune.")
+
+
+def _require_live_flm_session_inactive() -> None:
+  _require_live_flm_stopped()
+  if _live_baseline_path().is_file():
+    raise RuntimeError("Revert Live FLM before changing or replacing its active tune.")
 
 
 def _require_flm_offroad(params: Params | None = None) -> None:
@@ -918,6 +1008,210 @@ def start_flm_background_analysis(route_names: list[str], footage_paths: list[st
     threading.Thread(target=_watch_flm_process_for_onroad, args=(process_to_watch,), daemon=True).start()
 
   return flm_analyzer_running()
+
+
+def _capture_live_flm_baseline(paths: dict[str, Path], params: Params) -> tuple[dict[str, Any], bool]:
+  baseline_path = _live_baseline_path(paths)
+  existing = _read_json(baseline_path, {})
+  if isinstance(existing, dict) and isinstance(existing.get("params"), dict):
+    return existing, False
+
+  current_state = _snapshot_current_trial_state(params)
+  if str(current_state.get("FLMActiveProfileId", "") or "").startswith("live-flm"):
+    raise RuntimeError("Live FLM rollback data is missing. Revert or keep the current tune before starting a new live session.")
+
+  active_snapshot = _read_json(paths["snapshots"] / "active.json", {})
+  raw_persistent_baseline = params.get(FLM_TRIAL_BASELINE_PARAM, encoding="utf-8") or None
+  if isinstance(raw_persistent_baseline, str):
+    try:
+      raw_persistent_baseline = json.loads(raw_persistent_baseline)
+    except (TypeError, ValueError):
+      pass
+
+  baseline = {
+    "schemaVersion": 1,
+    "sessionId": f"{int(time.time())}-{secrets.token_hex(4)}",
+    "capturedAt": time.time(),
+    "params": current_state,
+    "activeSnapshot": active_snapshot if isinstance(active_snapshot, dict) and active_snapshot else None,
+    "persistentTrialBaseline": raw_persistent_baseline,
+    "startingTuneLabel": str(
+      active_snapshot.get("profileLabel")
+      if isinstance(active_snapshot, dict) and active_snapshot.get("profileLabel")
+      else current_state.get("FLMActiveProfileId") or "Current manual values"
+    ),
+  }
+  _write_json(baseline_path, baseline)
+  return baseline, True
+
+
+def start_live_flm_tuning() -> dict[str, Any]:
+  global FLM_LIVE_PROCESS
+
+  if flm_analyzer_running():
+    raise RuntimeError("Stop the route analysis before starting Live FLM.")
+
+  paths = ensure_flm_workspace()
+  params = Params(return_defaults=True)
+  with FLM_LIVE_LOCK:
+    if live_flm_running():
+      return read_live_flm_status()
+
+    baseline, baseline_created = _capture_live_flm_baseline(paths, params)
+    previous_status = read_live_flm_status()
+    resuming_session = not baseline_created and previous_status.get("sessionId") == baseline.get("sessionId")
+    initial_status = {
+      "pid": 0,
+      "sessionId": baseline["sessionId"],
+      "startedAt": float(previous_status.get("startedAt", time.time()) or time.time()) if resuming_session else time.time(),
+      "running": True,
+      "state": "starting",
+      "message": "Starting the on-device Live FLM worker.",
+      "adjustmentCount": int(previous_status.get("adjustmentCount", 0) or 0) if resuming_session else 0,
+      "sampleCount": 0,
+      "eligibleSampleCount": 0,
+      "windowSeconds": 0.0,
+      "changeLog": list(previous_status.get("changeLog", []))[-60:] if resuming_session else [],
+      "liveTrace": list(previous_status.get("liveTrace", []))[-240:] if resuming_session else [],
+      "startingTuneLabel": str(baseline.get("startingTuneLabel", "Current manual values") or "Current manual values"),
+      "canResume": False,
+      "canRevert": True,
+    }
+    _write_live_flm_status(initial_status)
+    repo_root = Path(__file__).resolve().parents[3]
+    command = [
+      "nice",
+      "-n",
+      "19",
+      sys.executable or "python3",
+      str(Path(__file__).resolve()),
+      "live-worker",
+      str(baseline["sessionId"]),
+    ]
+    log_file = None
+    try:
+      log_file = open(FLM_LIVE_LOG_PATH, "ab")
+      FLM_LIVE_PROCESS = subprocess.Popen(
+        command,
+        cwd=str(repo_root),
+        env=_worker_env(repo_root),
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+      )
+      status = {
+        **initial_status,
+        "pid": FLM_LIVE_PROCESS.pid,
+        "state": "waiting_onroad" if not params.get_bool("IsOnroad") else "observing",
+        "message": "Waiting for an onroad torque-control sample." if not params.get_bool("IsOnroad") else "Collecting a fresh evidence window.",
+      }
+      _write_live_flm_status(status)
+      return read_live_flm_status()
+    except Exception as error:
+      FLM_LIVE_PROCESS = None
+      if baseline_created:
+        try:
+          _live_baseline_path(paths).unlink()
+        except FileNotFoundError:
+          pass
+      _write_live_flm_status({
+        **initial_status,
+        "running": False,
+        "state": "failed",
+        "message": "Live FLM could not start.",
+        "error": f"{type(error).__name__}: {error}",
+        "canResume": not baseline_created,
+        "canRevert": not baseline_created,
+      })
+      raise
+    finally:
+      if log_file is not None:
+        log_file.close()
+
+
+def stop_live_flm_tuning() -> bool:
+  global FLM_LIVE_PROCESS
+
+  with FLM_LIVE_LOCK:
+    process = FLM_LIVE_PROCESS
+    status = read_live_flm_status()
+    pid = int(status.get("pid") or 0)
+    stopped = False
+
+    if process is not None and process.poll() is None:
+      _terminate_flm_process(process)
+      stopped = True
+    elif pid > 0 and status.get("running") and _live_flm_pid_matches(pid, status):
+      try:
+        os.killpg(pid, signal.SIGTERM)
+        stopped = True
+      except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        try:
+          os.kill(pid, signal.SIGTERM)
+          stopped = True
+        except (ProcessLookupError, PermissionError, OSError):
+          pass
+
+    FLM_LIVE_PROCESS = None
+    baseline_available = _live_baseline_path().is_file()
+    _write_live_flm_status({
+      **status,
+      "pid": 0,
+      "running": False,
+      "state": "stopped",
+      "message": "Live FLM is stopped. The current live tune remains active until it is resumed or reverted.",
+      "canResume": baseline_available,
+      "canRevert": baseline_available,
+    })
+    return stopped
+
+
+def revert_live_flm_tuning() -> dict[str, Any]:
+  stop_live_flm_tuning()
+  paths = ensure_flm_workspace()
+  baseline_path = _live_baseline_path(paths)
+  baseline = _read_json(baseline_path, {})
+  if not isinstance(baseline, dict) or not isinstance(baseline.get("params"), dict):
+    raise FileNotFoundError("live FLM baseline")
+
+  params = Params(return_defaults=True)
+  _apply_param_bundle(params, baseline["params"])
+  persistent_baseline = baseline.get("persistentTrialBaseline")
+  if persistent_baseline is None:
+    _clear_persistent_trial_baseline(params)
+  else:
+    params.put(FLM_TRIAL_BASELINE_PARAM, persistent_baseline)
+
+  active_snapshot_path = paths["snapshots"] / "active.json"
+  active_snapshot = baseline.get("activeSnapshot")
+  if isinstance(active_snapshot, dict) and active_snapshot:
+    _write_json(active_snapshot_path, active_snapshot)
+  else:
+    try:
+      active_snapshot_path.unlink()
+    except FileNotFoundError:
+      pass
+
+  try:
+    baseline_path.unlink()
+  except FileNotFoundError:
+    pass
+
+  status = read_live_flm_status()
+  _write_live_flm_status({
+    **status,
+    "pid": 0,
+    "running": False,
+    "state": "reverted",
+    "message": "Restored the exact tune that was active before Live FLM started.",
+    "canResume": False,
+    "canRevert": False,
+  })
+  return {
+    "message": "Reverted Live FLM to the exact pre-live tune.",
+    "liveStatus": read_live_flm_status(),
+    "workspace": list_workspace(),
+  }
 
 
 def _parse_segment_num(segment_name: str) -> int:
@@ -1575,7 +1869,7 @@ def _rich_profile_supports_knob(capabilities: dict[str, Any], suffix: str) -> bo
   return f"{rich_profile}.{suffix}" in get_flm_supported_vehicle_knobs()
 
 
-def _build_event_summaries(samples: list[FLMSample]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _build_event_summaries(samples: list[FLMSample], include_plots: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
   eligibility = _analysis_eligibility_mask(samples)
   active_samples = [sample for sample, allowed in zip(samples, eligibility, strict=True) if allowed]
   if not active_samples:
@@ -1723,11 +2017,11 @@ def _build_event_summaries(samples: list[FLMSample]) -> tuple[list[dict[str, Any
   for bucket, mask in base_masks.items():
     events = _group_masked_events(samples, mask, score_map[bucket])
     if events:
-      summaries.extend(_summaries_from_events(bucket, samples, events, eligibility))
+      summaries.extend(_summaries_from_events(bucket, samples, events, eligibility, include_plots=include_plots))
   if straight_windows:
-    summaries.extend(_summaries_from_events("center_chatter", samples, straight_windows, eligibility))
+    summaries.extend(_summaries_from_events("center_chatter", samples, straight_windows, eligibility, include_plots=include_plots))
   if curve_windows:
-    summaries.extend(_summaries_from_events("notchy_mid_curve", samples, curve_windows, eligibility))
+    summaries.extend(_summaries_from_events("notchy_mid_curve", samples, curve_windows, eligibility, include_plots=include_plots))
 
   left_errors = [abs(sample.actual_la) - abs(sample.desired_la) for sample in active_samples if sample.desired_la > 0.25]
   right_errors = [abs(sample.actual_la) - abs(sample.desired_la) for sample in active_samples if sample.desired_la < -0.25]
@@ -1766,7 +2060,7 @@ def _build_event_summaries(samples: list[FLMSample]) -> tuple[list[dict[str, Any
 
 
 def _summaries_from_events(bucket: str, samples: list[FLMSample], events: list[dict[str, Any]],
-                           eligibility: list[bool] | None = None) -> list[dict[str, Any]]:
+                           eligibility: list[bool] | None = None, include_plots: bool = True) -> list[dict[str, Any]]:
   grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
   for event in events:
     event_speed_band = event["speedBand"] if bucket == "center_chatter" else "mixed"
@@ -1788,7 +2082,7 @@ def _summaries_from_events(bucket: str, samples: list[FLMSample], events: list[d
     ]
     top_event = strongest[0]
     top_speed_band = top_event["speedBand"]
-    plot_data = _build_plot_data(samples, top_event, eligibility)
+    plot_data = _build_plot_data(samples, top_event, eligibility) if include_plots else {}
     summaries.append({
       "bucket": bucket_name,
       "dimensionId": f"{bucket_name}:{direction}:{top_speed_band}",
@@ -1804,14 +2098,14 @@ def _summaries_from_events(bucket: str, samples: list[FLMSample], events: list[d
         "chatterMetrics": top_event.get("metrics", {}),
       },
       "events": grouped_events,
-      "plotSvg": _build_plot_svg(plot_data),
+      "plotSvg": _build_plot_svg(plot_data) if include_plots else "",
       "plotData": plot_data,
     })
   return summaries
 
 
-def classify_torque_samples(samples: list[FLMSample]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-  return _build_event_summaries(samples)
+def classify_torque_samples(samples: list[FLMSample], include_plots: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+  return _build_event_summaries(samples, include_plots=include_plots)
 
 
 def _primary_delta_from_summary(summary: dict[str, Any], capabilities: dict[str, Any], current: dict[str, Any],
@@ -2544,6 +2838,84 @@ def build_trial_profiles(report_id: str, suggestions: list[dict[str, Any]], feed
   return profiles[:3]
 
 
+def select_live_profile_size(summaries: list[dict[str, Any]], summary_stats: dict[str, Any],
+                             suggestions: list[dict[str, Any]]) -> dict[str, Any]:
+  actionable_dimensions = {
+    str(suggestion.get("dimensionId", ""))
+    for suggestion in suggestions
+    if isinstance(suggestion.get("primaryAdjustmentRaw"), dict)
+  }
+  actionable = [
+    summary for summary in summaries
+    if str(summary.get("dimensionId", "")) in actionable_dimensions
+  ]
+  if not actionable:
+    return {
+      "profileKey": "",
+      "profileLabel": "None",
+      "multiplier": 0.0,
+      "reason": "The current window contains no confirmed, actionable controller mismatch.",
+      "maxSeverity": 0.0,
+      "weightedSeverity": 0.0,
+      "eventCount": 0,
+    }
+
+  event_counts = [max(int(summary.get("evidence", {}).get("eventCount", 0) or 0), 1) for summary in actionable]
+  severities = [max(float(summary.get("severity", 0.0) or 0.0), 0.0) for summary in actionable]
+  event_count = sum(event_counts)
+  max_severity = max(severities, default=0.0)
+  weighted_severity = sum(severity * count for severity, count in zip(severities, event_counts, strict=True)) / max(event_count, 1)
+  mean_error = max(float(summary_stats.get("meanErrorAbs", 0.0) or 0.0), 0.0)
+  severe_saturation = any(
+    summary.get("bucket") == "saturation_limited" and float(summary.get("severity", 0.0) or 0.0) >= 0.9
+    for summary in actionable
+  )
+
+  if (
+    event_count >= 4
+    and mean_error >= 0.13
+    and weighted_severity >= 0.85
+    and (max_severity >= 1.05 or severe_saturation)
+  ):
+    profile_key = "assertive"
+    profile_label = "Assertive"
+    multiplier = 1.35
+    reason = "Large tracking error is repeated across strong evidence, so Live FLM uses the existing assertive step."
+  elif event_count >= 2 and mean_error >= 0.09 and max_severity >= 0.7 and weighted_severity >= 0.6:
+    profile_key = "recommended"
+    profile_label = "Recommended"
+    multiplier = 1.0
+    reason = "The mismatch is clear but not extreme, so Live FLM uses the existing recommended step."
+  else:
+    profile_key = "conservative"
+    profile_label = "Conservative"
+    multiplier = 0.6
+    reason = "The mismatch is small, localized, or not yet strongly repeated, so Live FLM reduces the step near convergence."
+
+  return {
+    "profileKey": profile_key,
+    "profileLabel": profile_label,
+    "multiplier": multiplier,
+    "reason": reason,
+    "maxSeverity": round(max_severity, 4),
+    "weightedSeverity": round(weighted_severity, 4),
+    "eventCount": event_count,
+  }
+
+
+def _select_live_profile(profiles: list[dict[str, Any]], profile_key: str) -> dict[str, Any] | None:
+  preferred_orders = {
+    "conservative": ("conservative",),
+    "recommended": ("recommended", "conservative"),
+    "assertive": ("assertive", "recommended", "conservative"),
+  }
+  for suffix in preferred_orders.get(profile_key, (profile_key,)):
+    profile = next((item for item in profiles if str(item.get("id", "")).endswith(f":{suffix}")), None)
+    if profile is not None:
+      return profile
+  return None
+
+
 def _add_parameters_start_here(capabilities: dict[str, Any], suggestions: list[dict[str, Any]], primary_path_key: str) -> list[str]:
   lines = ["Turn on Advanced Lateral Tune before trying any suggested profile."]
   if primary_path_key == "baseline_fix":
@@ -2588,6 +2960,96 @@ def build_recommendation_paths(report_id: str, summaries: list[dict[str, Any]], 
       "profiles": profiles,
     })
   return paths, decision
+
+
+def _live_sample_from_messages(session_id: str, segment: int, timestamp: float, controls_state, car_state,
+                               car_control, car_output=None, live_parameters=None) -> FLMSample | None:
+  lateral_state = getattr(controls_state, "lateralControlState", None)
+  if lateral_state is None:
+    return None
+  try:
+    if lateral_state.which() != "torqueState":
+      return None
+  except Exception:
+    return None
+
+  torque_state = lateral_state.torqueState
+  roll_deg = math.degrees(float(getattr(live_parameters, "roll", 0.0) or 0.0)) if live_parameters is not None else 0.0
+  out_torque = float(getattr(getattr(car_output, "actuatorsOutput", None), "torque", 0.0) or 0.0) if car_output is not None else 0.0
+  return FLMSample(
+    route=f"live:{session_id}",
+    segment=segment,
+    t=float(timestamp),
+    v_ego=float(getattr(car_state, "vEgo", 0.0) or 0.0),
+    lat_active=bool(getattr(car_control, "latActive", False)),
+    steering_pressed=bool(getattr(car_state, "steeringPressed", False)),
+    saturated=bool(getattr(torque_state, "saturated", False)),
+    actual_la=float(getattr(torque_state, "actualLateralAccel", 0.0) or 0.0),
+    desired_la=float(getattr(torque_state, "desiredLateralAccel", 0.0) or 0.0),
+    desired_jerk=float(getattr(torque_state, "desiredLateralJerk", 0.0) or 0.0),
+    error=float(getattr(torque_state, "error", 0.0) or 0.0),
+    error_rate=float(getattr(torque_state, "errorRate", 0.0) or 0.0),
+    p=float(getattr(torque_state, "p", 0.0) or 0.0),
+    i=float(getattr(torque_state, "i", 0.0) or 0.0),
+    d=float(getattr(torque_state, "d", 0.0) or 0.0),
+    f=float(getattr(torque_state, "f", 0.0) or 0.0),
+    output=float(getattr(torque_state, "output", 0.0) or 0.0),
+    steering_angle_deg=float(getattr(car_state, "steeringAngleDeg", 0.0) or 0.0),
+    steering_torque=float(getattr(car_state, "steeringTorque", 0.0) or 0.0),
+    cmd_torque=float(getattr(getattr(car_control, "actuators", None), "torque", 0.0) or 0.0),
+    out_torque=out_torque,
+    roll_deg=roll_deg,
+  )
+
+
+def _live_window_seconds(samples: list[FLMSample]) -> float:
+  return max(float(samples[-1].t - samples[0].t), 0.0) if len(samples) >= 2 else 0.0
+
+
+def _build_live_adjustment_plan(samples: list[FLMSample], car_params, params: Params,
+                                session_id: str, adjustment_count: int) -> dict[str, Any]:
+  effective_car_params = _effective_torque_car_params(car_params)
+  hyundai_canfd = bool(getattr(effective_car_params, "flags", 0) & HyundaiFlags.CANFD)
+  capabilities = dict(get_flm_capabilities(
+    effective_car_params.carFingerprint,
+    brand=str(getattr(effective_car_params, "brand", "") or ""),
+    hyundai_canfd=hyundai_canfd,
+    torque_control=True,
+  ))
+  capabilities["nonlinearTorqueMap"] = _nonlinear_torque_map(effective_car_params)
+  current_params = _current_param_state(effective_car_params, params)
+  raw_summaries, summary_stats = classify_torque_samples(samples, include_plots=False)
+  summaries = _resolve_conflicting_actionable_suggestions(raw_summaries)
+  report_id = f"live-{session_id}-{adjustment_count + 1}"
+  car_fingerprint = str(getattr(effective_car_params, "carFingerprint", "") or "")
+  paths_payload, decision = build_recommendation_paths(
+    report_id,
+    summaries,
+    summary_stats,
+    capabilities,
+    current_params,
+    {},
+    cleanup_progress_locked=_cleanup_progress_locked(car_fingerprint),
+  )
+  primary_path = next((path for path in paths_payload if path.get("isPrimary")), paths_payload[0] if paths_payload else {})
+  suggestions = list(primary_path.get("suggestions", []))
+  size = select_live_profile_size(summaries, summary_stats, suggestions)
+  profile = _select_live_profile(list(primary_path.get("profiles", [])), str(size.get("profileKey", "")))
+  actionable_buckets = sorted({
+    str(suggestion.get("bucket", ""))
+    for suggestion in suggestions
+    if isinstance(suggestion.get("primaryAdjustmentRaw"), dict) and suggestion.get("bucket")
+  })
+  return {
+    "profile": profile,
+    "step": size,
+    "summaryStats": summary_stats,
+    "pathKey": str(primary_path.get("key", decision.get("primaryPathKey", "")) or ""),
+    "pathLabel": str(primary_path.get("title", "") or ""),
+    "pathReason": str(primary_path.get("whySelected", decision.get("reason", "")) or ""),
+    "actionableBuckets": actionable_buckets,
+    "carFingerprint": car_fingerprint,
+  }
 
 
 def _render_report_html(report: dict[str, Any]) -> str:
@@ -3729,6 +4191,7 @@ def list_workspace() -> dict[str, Any]:
     "feedbackCount": len(feedback_files),
     "activeTrial": active_snapshot,
     "status": read_flm_status(),
+    "liveStatus": read_live_flm_status(),
   }
 
 
@@ -3776,6 +4239,8 @@ def clear_workspace() -> dict[str, Any]:
   status = read_flm_status()
   if status.get("running"):
     raise RuntimeError("Stop the active FLM analysis before clearing the workspace.")
+  if live_flm_running():
+    raise RuntimeError("Stop Live FLM before clearing the workspace.")
 
   params = Params(return_defaults=True)
   active_snapshot = _read_json(paths["snapshots"] / "active.json", {})
@@ -3808,6 +4273,11 @@ def clear_workspace() -> dict[str, Any]:
 
   _clear_persistent_trial_baseline(params)
   clear_flm_status()
+  try:
+    _live_baseline_path(paths).unlink()
+  except FileNotFoundError:
+    pass
+  clear_live_flm_status()
 
   return {
     "message": "Cleared saved tuning reports, feedback, profiles, snapshots, and uploaded rlogs.",
@@ -3929,6 +4399,109 @@ def _merge_flm_override_state(base: dict[str, Any], delta: dict[str, Any]) -> di
   return normalize_flm_overrides(merged)
 
 
+def _apply_live_flm_profile(profile: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+  paths = ensure_flm_workspace()
+  baseline = _read_json(_live_baseline_path(paths), {})
+  if not isinstance(baseline, dict) or not isinstance(baseline.get("params"), dict):
+    raise RuntimeError("Live FLM cannot apply an adjustment without its pre-live rollback baseline.")
+
+  params = Params(return_defaults=True)
+  current_state = _snapshot_current_trial_state(params)
+  active_snapshot_path = paths["snapshots"] / "active.json"
+  raw_active_snapshot = _read_json(active_snapshot_path, {})
+  if not isinstance(raw_active_snapshot, dict):
+    raw_active_snapshot = {}
+  previous_display_state = _active_trial_display_state(paths, raw_active_snapshot) or {}
+
+  rollback_params = raw_active_snapshot.get("params") if isinstance(raw_active_snapshot.get("params"), dict) else baseline["params"]
+  generic_delta = {
+    key: value for key, value in dict(profile.get("genericParams", {})).items()
+    if key in FLM_ADVANCED_LATERAL_PARAM_KEYS
+  }
+  override_delta = normalize_flm_overrides(profile.get("flmOverrides", {}))
+  merged_overrides = _merge_flm_override_state(current_state.get("FLMActiveOverrides", {}), override_delta)
+
+  final_generic_state = {
+    key: generic_delta.get(key, current_state.get(key))
+    for key in FLM_ADVANCED_LATERAL_PARAM_KEYS
+    if key in current_state or key in generic_delta
+  }
+  applied_generic_params = {
+    key: value for key, value in final_generic_state.items()
+    if key not in rollback_params or value != rollback_params.get(key)
+  }
+  rollback_overrides = normalize_flm_overrides(rollback_params.get("FLMActiveOverrides", {}))
+  applied_friction_thresholds = {
+    family: payload
+    for family, payload in merged_overrides.get("baseFrictionThresholds", {}).items()
+    if payload != rollback_overrides.get("baseFrictionThresholds", {}).get(family)
+  }
+  applied_vehicle_knobs = {
+    symbol: value
+    for symbol, value in merged_overrides.get("vehicleKnobs", {}).items()
+    if value != rollback_overrides.get("vehicleKnobs", {}).get(symbol)
+  }
+
+  step = plan.get("step", {})
+  session_id = str(baseline.get("sessionId", "") or "")
+  now = time.time()
+  snapshot = {
+    "reportId": "live-flm",
+    "profileId": f"live-flm:{session_id}",
+    "profileLabel": f"Live FLM · {step.get('profileLabel', profile.get('label', 'Adaptive'))}",
+    "carFingerprint": str(plan.get("carFingerprint", "") or ""),
+    "pathKey": str(plan.get("pathKey", "") or ""),
+    "pathLabel": str(plan.get("pathLabel", "") or ""),
+    "capturedAt": float(raw_active_snapshot.get("capturedAt", baseline.get("capturedAt", now)) or now),
+    "updatedAt": now,
+    "sessionStartedAt": float(baseline.get("capturedAt", now) or now),
+    "revisionCount": int(previous_display_state.get("revisionCount", 0) or 0) + 1,
+    "params": rollback_params,
+    "appliedGenericParams": applied_generic_params,
+    "appliedFrictionThresholds": applied_friction_thresholds,
+    "appliedVehicleKnobs": applied_vehicle_knobs,
+    "liveStep": str(step.get("profileKey", "") or ""),
+  }
+  _write_json(active_snapshot_path, snapshot)
+  _persist_trial_baseline(params, snapshot)
+
+  bundle = dict(profile.get("genericParams", {}))
+  bundle["FLMActiveProfileId"] = snapshot["profileId"]
+  bundle["FLMActiveOverrides"] = merged_overrides
+  bundle["FLMTrialApplied"] = True
+
+  changes = []
+  for key, next_value in profile.get("genericParams", {}).items():
+    if key not in FLM_ADVANCED_LATERAL_PARAM_KEYS:
+      continue
+    previous_value = current_state.get(key)
+    if previous_value != next_value:
+      changes.append({"key": key, "from": previous_value, "to": next_value})
+  for family, payload in override_delta.get("baseFrictionThresholds", {}).items():
+    previous_values = _current_family_curve(family, current_state)
+    next_values = list(payload.get("values", []))
+    if previous_values != next_values:
+      changes.append({"key": f"base_friction_threshold.{family}", "from": previous_values, "to": next_values})
+  for symbol, next_value in override_delta.get("vehicleKnobs", {}).items():
+    previous_value = _current_vehicle_knob_value(symbol, current_state)
+    if previous_value != next_value:
+      changes.append({"key": symbol, "from": previous_value, "to": next_value})
+
+  _apply_param_bundle(params, bundle)
+
+  if plan.get("pathKey") == "cleanup_pass" and plan.get("carFingerprint"):
+    _record_cleanup_progress(str(plan["carFingerprint"]), "live-flm")
+
+  changed_keys = sorted(str(change["key"]) for change in changes)
+  return {
+    "profileId": snapshot["profileId"],
+    "profileLabel": snapshot["profileLabel"],
+    "changedKeys": changed_keys,
+    "changes": changes,
+    "activeSnapshot": snapshot,
+  }
+
+
 def _find_revert_snapshot(paths: dict[str, Path], active_snapshot: dict[str, Any],
                           current_profile_id: str = "", params: Params | None = None) -> dict[str, Any] | None:
   if isinstance(active_snapshot, dict) and isinstance(active_snapshot.get("params"), dict):
@@ -4022,6 +4595,7 @@ def _active_trial_car_fingerprint(paths: dict[str, Path], active_snapshot: dict[
 
 
 def save_active_trial_as_tune(name: str) -> dict[str, Any]:
+  _require_live_flm_stopped()
   paths = ensure_flm_workspace()
   params = Params(return_defaults=True)
   if not params.get_bool("FLMTrialApplied"):
@@ -4083,6 +4657,43 @@ def save_active_trial_as_tune(name: str) -> dict[str, Any]:
   }
 
 
+def save_live_flm_tune(name: str) -> dict[str, Any]:
+  paths = ensure_flm_workspace()
+  baseline_path = _live_baseline_path(paths)
+  if not baseline_path.is_file():
+    raise RuntimeError("Start Live FLM before saving a live tune.")
+
+  # Stop first so the worker cannot apply another adjustment while the tune is
+  # being captured. If saving fails, keep the live rollback baseline so the
+  # user can still resume or revert the session.
+  stop_live_flm_tuning()
+  result = save_active_trial_as_tune(name)
+
+  try:
+    baseline_path.unlink()
+  except FileNotFoundError:
+    pass
+
+  tune = result["tune"]
+  status = read_live_flm_status()
+  _write_live_flm_status({
+    **status,
+    "pid": 0,
+    "running": False,
+    "state": "saved",
+    "message": f"Live FLM stopped and saved as {tune['name']}.",
+    "savedTuneId": tune["tuneId"],
+    "canResume": False,
+    "canRevert": False,
+  })
+  result.update({
+    "message": f"Stopped Live FLM and saved {tune['name']} in Saved Tunes.",
+    "liveStatus": read_live_flm_status(),
+    "workspace": list_workspace(),
+  })
+  return result
+
+
 def submit_saved_tune(tune_id: str, discord_username: str) -> dict[str, Any]:
   _require_flm_offroad()
   paths = ensure_flm_workspace()
@@ -4122,6 +4733,7 @@ def submit_saved_tune(tune_id: str, discord_username: str) -> dict[str, Any]:
 
 
 def apply_saved_tune(tune_id: str) -> dict[str, Any]:
+  _require_live_flm_session_inactive()
   paths = ensure_flm_workspace()
   tune = _load_saved_tune(tune_id, paths)
   params = Params(return_defaults=True)
@@ -4247,6 +4859,7 @@ def delete_saved_tune(tune_id: str) -> dict[str, Any]:
 
 
 def apply_trial_profile(report_id: str, profile_id: str) -> dict[str, Any]:
+  _require_live_flm_session_inactive()
   paths = ensure_flm_workspace()
   params = Params(return_defaults=True)
   profiles = _read_json(paths["profiles"] / f"{report_id}.json", [])
@@ -4347,6 +4960,7 @@ def apply_trial_profile(report_id: str, profile_id: str) -> dict[str, Any]:
 
 
 def apply_custom_trial(report_id: str, payload: Any) -> dict[str, Any]:
+  _require_live_flm_session_inactive()
   paths = ensure_flm_workspace()
   params = Params(return_defaults=True)
   _require_flm_offroad(params)
@@ -4428,6 +5042,8 @@ def apply_custom_trial(report_id: str, payload: Any) -> dict[str, Any]:
 
 
 def revert_trial_profile() -> dict[str, Any]:
+  if _live_baseline_path().is_file():
+    return revert_live_flm_tuning()
   paths = ensure_flm_workspace()
   snapshot_path = paths["snapshots"] / "active.json"
   snapshot = _read_json(snapshot_path, {})
@@ -4462,6 +5078,7 @@ def revert_trial_profile() -> dict[str, Any]:
 
 
 def accept_trial_as_baseline() -> dict[str, Any]:
+  _require_live_flm_session_inactive()
   paths = ensure_flm_workspace()
   params = Params(return_defaults=True)
   active_snapshot = _read_json(paths["snapshots"] / "active.json", {})
@@ -4587,9 +5204,231 @@ def run_worker(payload_json: str) -> None:
     raise
 
 
+def run_live_worker(session_id: str) -> None:
+  # Keep messaging out of the module import path so FLM report tooling and its
+  # unit tests do not need a live msgq runtime.
+  from cereal import messaging
+
+  paths = ensure_flm_workspace()
+  baseline = _read_json(_live_baseline_path(paths), {})
+  if not isinstance(baseline, dict) or str(baseline.get("sessionId", "")) != str(session_id):
+    raise RuntimeError("Live FLM session does not match its rollback baseline.")
+
+  params = Params(return_defaults=True)
+  previous_status = read_live_flm_status()
+  started_at = float(previous_status.get("startedAt", time.time()) or time.time())
+  adjustment_count = int(previous_status.get("adjustmentCount", 0) or 0)
+  samples: list[FLMSample] = []
+  pending_plan: dict[str, Any] | None = None
+  road_segment = 0
+  onroad = params.get_bool("IsOnroad")
+  was_onroad = onroad
+  last_onroad_check = 0.0
+  last_evaluation = time.monotonic()
+  collect_after = 0.0
+  last_status_write = 0.0
+  state = "observing" if onroad else "waiting_onroad"
+  message = "Collecting a fresh evidence window." if onroad else "Waiting for the vehicle to go onroad."
+  latest_stats: dict[str, Any] = {}
+  last_step: dict[str, Any] = {}
+  last_changed_keys: list[str] = []
+  last_buckets: list[str] = []
+  last_path_label = ""
+  starting_tune_label = str(baseline.get("startingTuneLabel", "Current manual values") or "Current manual values")
+  change_log = [item for item in previous_status.get("changeLog", []) if isinstance(item, dict)][-60:]
+  live_trace = [item for item in previous_status.get("liveTrace", []) if isinstance(item, dict)][-240:]
+  last_trace_sample = float(live_trace[-1].get("t", 0.0) or 0.0) if live_trace else 0.0
+  persistent_car_params = params.get("CarParamsPersistent")
+
+  try:
+    sm = messaging.SubMaster(
+      ["controlsState", "carState", "carControl", "carOutput", "liveParameters", "carParams"],
+      poll="controlsState",
+    )
+    while True:
+      sm.update(100)
+      monotonic_now = time.monotonic()
+
+      if monotonic_now - last_onroad_check >= FLM_ONROAD_POLL_INTERVAL_SECONDS:
+        onroad = params.get_bool("IsOnroad")
+        last_onroad_check = monotonic_now
+
+      if not onroad:
+        if was_onroad:
+          road_segment += 1
+        was_onroad = False
+        samples.clear()
+        pending_plan = None
+        collect_after = 0.0
+        latest_stats = {}
+        state = "waiting_onroad"
+        message = "Waiting for the vehicle to go onroad."
+      elif bool(getattr(sm, "updated", {}).get("controlsState", False)):
+        if not was_onroad:
+          live_trace = []
+          last_trace_sample = 0.0
+        was_onroad = True
+        controls_state = sm["controlsState"]
+        car_state = sm["carState"]
+        car_control = sm["carControl"]
+        car_params = sm["carParams"]
+        timestamp = float(getattr(sm, "logMonoTime", {}).get("controlsState", 0) or 0) / 1e9
+        if timestamp <= 0.0:
+          timestamp = monotonic_now
+        sample = _live_sample_from_messages(
+          session_id,
+          road_segment,
+          timestamp,
+          controls_state,
+          car_state,
+          car_control,
+          sm["carOutput"],
+          sm["liveParameters"],
+        )
+
+        car_fingerprint = str(getattr(car_params, "carFingerprint", "") or "")
+        if not car_fingerprint and not persistent_car_params:
+          persistent_car_params = params.get("CarParamsPersistent")
+        if sample is None or (not car_fingerprint and not persistent_car_params):
+          state = "waiting_for_torque_control"
+          message = "Waiting for live torque-controller and car-parameter data."
+        else:
+          samples.append(sample)
+          if sample.t - last_trace_sample >= 0.25:
+            live_trace.append({
+              "t": round(sample.t, 2),
+              "desired": round(sample.desired_la, 4),
+              "actual": round(sample.actual_la, 4),
+            })
+            live_trace = live_trace[-240:]
+            last_trace_sample = sample.t
+          settling = monotonic_now < collect_after
+          if settling:
+            samples.clear()
+            state = "settling"
+            message = "Waiting for the newly applied values to reach the controller before collecting fresh evidence."
+          cutoff = sample.t - FLM_LIVE_MAX_WINDOW_SECONDS
+          if samples and samples[0].t < cutoff:
+            first_kept = next((idx for idx, item in enumerate(samples) if item.t >= cutoff), len(samples))
+            samples = samples[first_kept:]
+
+          window_seconds = _live_window_seconds(samples)
+          if not settling and pending_plan is None and window_seconds < FLM_LIVE_MIN_WINDOW_SECONDS:
+            state = "observing"
+            message = f"Collecting a fresh {FLM_LIVE_MIN_WINDOW_SECONDS:.0f}-second evidence window."
+
+          if (
+            pending_plan is None
+            and not settling
+            and window_seconds >= FLM_LIVE_MIN_WINDOW_SECONDS
+            and monotonic_now - last_evaluation >= FLM_LIVE_EVALUATION_INTERVAL_SECONDS
+          ):
+            state = "evaluating"
+            message = "Evaluating desired-versus-actual lateral behavior with FLM."
+            last_evaluation = monotonic_now
+            if car_fingerprint:
+              plan = _build_live_adjustment_plan(samples, car_params, params, session_id, adjustment_count)
+            else:
+              with car.CarParams.from_bytes(persistent_car_params) as stored_car_params:
+                plan = _build_live_adjustment_plan(samples, stored_car_params, params, session_id, adjustment_count)
+            latest_stats = dict(plan.get("summaryStats", {}))
+            last_step = dict(plan.get("step", {}))
+            last_buckets = list(plan.get("actionableBuckets", []))
+            last_path_label = str(plan.get("pathLabel", "") or "")
+            if int(latest_stats.get("sampleCount", 0) or 0) < FLM_LIVE_MIN_ELIGIBLE_SAMPLES:
+              state = "observing"
+              message = "More lateral-control evidence is needed before changing the tune."
+            elif plan.get("profile") is None:
+              if last_step.get("profileKey"):
+                state = "at_limit"
+                message = "FLM found a mismatch, but no supported value can move further at this step size."
+              else:
+                state = "synced"
+                message = "No actionable mismatch is present in the current FLM evidence window."
+            else:
+              pending_plan = plan
+              state = "applying"
+              message = "Applying the adaptive FLM adjustment immediately."
+
+          if pending_plan is not None:
+            apply_result = _apply_live_flm_profile(pending_plan["profile"], pending_plan)
+            adjustment_count += 1
+            last_changed_keys = list(apply_result.get("changedKeys", []))
+            last_step = dict(pending_plan.get("step", {}))
+            for change in apply_result.get("changes", []):
+              if not isinstance(change, dict):
+                continue
+              change_log.append({
+                **change,
+                "at": time.time(),
+                "adjustment": adjustment_count,
+                "stepLabel": str(last_step.get("profileLabel", "") or ""),
+              })
+            change_log = change_log[-60:]
+            latest_stats = dict(pending_plan.get("summaryStats", {}))
+            last_buckets = list(pending_plan.get("actionableBuckets", []))
+            last_path_label = str(pending_plan.get("pathLabel", "") or "")
+            message = (
+              f"Applied a {last_step.get('profileLabel', 'FLM')} step. "
+              "Collecting entirely fresh evidence before the next adjustment."
+            )
+            state = "observing"
+            pending_plan = None
+            samples.clear()
+            last_evaluation = monotonic_now
+            collect_after = monotonic_now + 3.0
+
+      if monotonic_now - last_status_write >= FLM_LIVE_STATUS_INTERVAL_SECONDS:
+        approximate_eligible = sum(1 for sample in samples if sample.lat_active and not sample.steering_pressed)
+        _write_live_flm_status({
+          "pid": os.getpid(),
+          "sessionId": session_id,
+          "startedAt": started_at,
+          "running": True,
+          "state": state,
+          "message": message,
+          "adjustmentCount": adjustment_count,
+          "sampleCount": len(samples),
+          "eligibleSampleCount": approximate_eligible,
+          "windowSeconds": round(_live_window_seconds(samples), 1),
+          "meanErrorAbs": latest_stats.get("meanErrorAbs"),
+          "meanDesiredAbs": latest_stats.get("meanDesiredAbs"),
+          "lastStepKey": str(last_step.get("profileKey", "") or ""),
+          "lastStepLabel": str(last_step.get("profileLabel", "") or ""),
+          "lastStepMultiplier": float(last_step.get("multiplier", 0.0) or 0.0),
+          "lastStepReason": str(last_step.get("reason", "") or ""),
+          "lastChangedKeys": last_changed_keys,
+          "changeLog": change_log,
+          "liveTrace": live_trace,
+          "lastBuckets": last_buckets,
+          "lastPathLabel": last_path_label,
+          "startingTuneLabel": starting_tune_label,
+          "pendingAdjustment": pending_plan is not None,
+          "canResume": False,
+          "canRevert": True,
+        })
+        last_status_write = monotonic_now
+  except Exception as error:
+    status = read_live_flm_status()
+    _write_live_flm_status({
+      **status,
+      "pid": 0,
+      "running": False,
+      "state": "failed",
+      "message": "Live FLM stopped after an internal error.",
+      "error": f"{type(error).__name__}: {error}",
+      "canResume": True,
+      "canRevert": _live_baseline_path(paths).is_file(),
+    })
+    raise
+
+
 def main() -> None:
   if len(sys.argv) >= 3 and sys.argv[1] == "worker":
     run_worker(sys.argv[2])
+    return
+  if len(sys.argv) >= 3 and sys.argv[1] == "live-worker":
+    run_live_worker(sys.argv[2])
     return
   if len(sys.argv) >= 2 and sys.argv[1] == "analyze":
     routes = sys.argv[2:]
@@ -4597,7 +5436,7 @@ def main() -> None:
     report = analyze_routes(routes, footage_paths)
     print(json.dumps({"reportId": report["reportId"], "htmlPath": report["htmlPath"], "jsonPath": report["jsonPath"]}, indent=2))
     return
-  print("Usage: flm_workspace.py analyze <route> [<route>...]")
+  print("Usage: flm_workspace.py analyze <route> [<route>...] | live-worker <session-id>")
 
 
 if __name__ == "__main__":

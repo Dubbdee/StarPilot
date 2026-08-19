@@ -1097,6 +1097,64 @@ def test_build_trial_profiles_returns_none_when_every_dimension_is_ignored(tmp_p
   assert profiles == []
 
 
+@pytest.mark.parametrize(
+  "severity,event_count,mean_error,expected",
+  [
+    (1.2, 5, 0.18, "assertive"),
+    (0.8, 2, 0.10, "recommended"),
+    (0.9, 1, 0.07, "conservative"),
+  ],
+)
+def test_live_profile_size_adapts_to_issue_strength(tmp_path, severity, event_count, mean_error, expected):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  dimension_id = "understeer:left:mid"
+  summaries = [{
+    "dimensionId": dimension_id,
+    "bucket": "understeer",
+    "severity": severity,
+    "evidence": {"eventCount": event_count},
+  }]
+  suggestions = [{
+    "dimensionId": dimension_id,
+    "primaryAdjustmentRaw": {
+      "type": "generic_param",
+      "paramKey": "SteerLatAccel",
+      "current": 1.5,
+      "suggested": 1.6,
+      "delta": 0.1,
+    },
+  }]
+
+  selected = module.select_live_profile_size(summaries, {"meanErrorAbs": mean_error}, suggestions)
+
+  assert selected["profileKey"] == expected
+  assert selected["multiplier"] == pytest.approx({"conservative": 0.6, "recommended": 1.0, "assertive": 1.35}[expected])
+
+
+def test_live_profile_size_makes_no_change_without_actionable_evidence(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  selected = module.select_live_profile_size(
+    [{"dimensionId": "model_limited:overall", "bucket": "model_limited", "severity": 0.25, "evidence": {"eventCount": 1}}],
+    {"meanErrorAbs": 0.04},
+    [{"dimensionId": "model_limited:overall", "currentVsSuggested": None}],
+  )
+
+  assert selected["profileKey"] == ""
+  assert selected["multiplier"] == 0.0
+
+
+def test_live_profile_selection_never_escalates_a_conservative_step(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  profiles = [
+    {"id": "live:cleanup_pass:recommended"},
+    {"id": "live:cleanup_pass:assertive"},
+  ]
+
+  assert module._select_live_profile(profiles, "conservative") is None
+  assert module._select_live_profile(profiles, "recommended")["id"].endswith(":recommended")
+  assert module._select_live_profile(profiles, "assertive")["id"].endswith(":assertive")
+
+
 def test_merge_primary_adjustments_averages_conflicting_deltas(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
   suggestions = [
@@ -1880,3 +1938,159 @@ def test_select_report_path_persists_manual_override(tmp_path):
   assert selected["pathSelectionSource"] == "manual"
   assert selected["primaryPathKey"] == "cleanup_pass"
   assert selected["suggestions"] == [baseline_suggestion]
+
+
+def test_live_flm_revert_restores_exact_pre_live_saved_tune(tmp_path):
+  module, fake_params_cls = _load_flm_workspace_module(tmp_path)
+  module.FLM_LIVE_STATUS_PATH = tmp_path / "live_status.json"
+  workspace = module.ensure_flm_workspace()
+  symbol = "hyundai_ioniq_6.ff_gain_left"
+  manual_baseline = {
+    "AdvancedLateralTune": False,
+    "ForceAutoTune": True,
+    "ForceAutoTuneOff": False,
+    "UseAutoSteerDelay": True,
+    "SteerDelay": 0.25,
+    "SteerFriction": 0.1,
+    "SteerKP": 1.0,
+    "SteerLatAccel": 1.5,
+    "SteerRatio": 15.0,
+    "FLMActiveProfileId": "",
+    "FLMActiveOverrides": {},
+    "FLMTrialApplied": False,
+  }
+  pre_live_params = {
+    **manual_baseline,
+    "AdvancedLateralTune": True,
+    "ForceAutoTune": False,
+    "ForceAutoTuneOff": True,
+    "SteerLatAccel": 1.72,
+    "FLMActiveProfileId": "saved:daily-driver",
+    "FLMActiveOverrides": {
+      "schemaVersion": 1,
+      "baseFrictionThresholds": {},
+      "vehicleKnobs": {symbol: 0.14},
+    },
+    "FLMTrialApplied": True,
+  }
+  persistent_baseline = {"params": manual_baseline, "capturedAt": 10.0}
+  fake_params_cls._store = {
+    **pre_live_params,
+    module.FLM_TRIAL_BASELINE_PARAM: persistent_baseline,
+  }
+  active_snapshot = {
+    "reportId": "saved-source",
+    "profileId": "saved:daily-driver",
+    "profileLabel": "Daily Driver",
+    "capturedAt": 10.0,
+    "params": manual_baseline,
+    "appliedGenericParams": {"AdvancedLateralTune": True, "SteerLatAccel": 1.72},
+    "appliedFrictionThresholds": {},
+    "appliedVehicleKnobs": {symbol: 0.14},
+  }
+  module._write_json(workspace["snapshots"] / "active.json", active_snapshot)
+  live_baseline, created = module._capture_live_flm_baseline(workspace, module.Params(return_defaults=True))
+  assert created is True
+  assert live_baseline["params"]["FLMActiveProfileId"] == "saved:daily-driver"
+  assert live_baseline["startingTuneLabel"] == "Daily Driver"
+
+  profile = {
+    "id": "live-test:cleanup_pass:assertive",
+    "label": "Assertive",
+    "genericParams": {
+      "AdvancedLateralTune": True,
+      "ForceAutoTune": False,
+      "ForceAutoTuneOff": True,
+      "SteerLatAccel": 1.84,
+    },
+    "flmOverrides": {
+      "schemaVersion": 1,
+      "baseFrictionThresholds": {},
+      "vehicleKnobs": {symbol: 0.2},
+    },
+  }
+  plan = {
+    "step": {"profileKey": "assertive", "profileLabel": "Assertive", "multiplier": 1.35},
+    "pathKey": "baseline_fix",
+    "pathLabel": "Baseline Fix",
+    "carFingerprint": "TEST_CAR",
+  }
+  apply_result = module._apply_live_flm_profile(profile, plan)
+
+  assert fake_params_cls._store["FLMActiveProfileId"].startswith("live-flm:")
+  assert fake_params_cls._store["SteerLatAccel"] == pytest.approx(1.84)
+  assert fake_params_cls._store["FLMActiveOverrides"]["vehicleKnobs"][symbol] == pytest.approx(0.2)
+  changes = {change["key"]: change for change in apply_result["changes"]}
+  assert changes["SteerLatAccel"]["from"] == pytest.approx(1.72)
+  assert changes["SteerLatAccel"]["to"] == pytest.approx(1.84)
+  assert changes[symbol]["from"] == pytest.approx(0.14)
+  assert changes[symbol]["to"] == pytest.approx(0.2)
+
+  module.revert_live_flm_tuning()
+
+  for key, value in pre_live_params.items():
+    assert fake_params_cls._store[key] == value
+  assert fake_params_cls._store[module.FLM_TRIAL_BASELINE_PARAM] == persistent_baseline
+  assert json.loads((workspace["snapshots"] / "active.json").read_text(encoding="utf-8")) == active_snapshot
+  assert not module._live_baseline_path(workspace).exists()
+
+
+def test_save_live_flm_tune_finishes_session_in_standard_saved_tunes(tmp_path):
+  module, fake_params_cls = _load_flm_workspace_module(tmp_path)
+  module.FLM_LIVE_STATUS_PATH = tmp_path / "live_status.json"
+  workspace = module.ensure_flm_workspace()
+  symbol = "hyundai_ioniq_6.ff_gain_left"
+  manual_baseline = {
+    "AdvancedLateralTune": False,
+    "ForceAutoTune": True,
+    "ForceAutoTuneOff": False,
+    "UseAutoSteerDelay": True,
+    "SteerDelay": 0.25,
+    "SteerFriction": 0.1,
+    "SteerKP": 1.0,
+    "SteerLatAccel": 1.5,
+    "SteerRatio": 15.0,
+    "FLMActiveProfileId": "",
+    "FLMActiveOverrides": {},
+    "FLMTrialApplied": False,
+  }
+  fake_params_cls._store = dict(manual_baseline)
+  module._capture_live_flm_baseline(workspace, module.Params(return_defaults=True))
+
+  module._apply_live_flm_profile({
+    "id": "live-test:baseline_fix:recommended",
+    "label": "Recommended",
+    "genericParams": {
+      "AdvancedLateralTune": True,
+      "ForceAutoTune": False,
+      "ForceAutoTuneOff": True,
+      "SteerLatAccel": 1.84,
+    },
+    "flmOverrides": {
+      "schemaVersion": 1,
+      "baseFrictionThresholds": {},
+      "vehicleKnobs": {symbol: 0.2},
+    },
+  }, {
+    "step": {"profileKey": "recommended", "profileLabel": "Recommended", "multiplier": 1.0},
+    "pathKey": "baseline_fix",
+    "pathLabel": "Baseline Fix",
+    "carFingerprint": "TEST_CAR",
+  })
+
+  result = module.save_live_flm_tune("Live Daily Driver")
+  tune = result["tune"]
+
+  assert fake_params_cls._store["SteerLatAccel"] == pytest.approx(1.84)
+  assert fake_params_cls._store["FLMActiveOverrides"]["vehicleKnobs"][symbol] == pytest.approx(0.2)
+  assert fake_params_cls._store["FLMActiveProfileId"] == f"saved:{tune['tuneId']}"
+  assert tune["genericParams"]["SteerLatAccel"] == pytest.approx(1.84)
+  assert tune["flmOverrides"]["vehicleKnobs"][symbol] == pytest.approx(0.2)
+  assert next(saved for saved in result["workspace"]["savedTunes"] if saved["tuneId"] == tune["tuneId"])["active"] is True
+  assert not module._live_baseline_path(workspace).exists()
+  assert result["liveStatus"]["state"] == "saved"
+  assert result["liveStatus"]["canResume"] is False
+  assert result["liveStatus"]["canRevert"] is False
+
+  module.revert_trial_profile()
+  assert fake_params_cls._store["SteerLatAccel"] == pytest.approx(manual_baseline["SteerLatAccel"])
