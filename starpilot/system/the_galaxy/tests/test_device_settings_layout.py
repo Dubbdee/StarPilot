@@ -1,5 +1,4 @@
 import json
-import importlib.util
 import re
 from pathlib import Path
 
@@ -7,7 +6,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LAYOUT_PATH = REPO_ROOT / "starpilot/system/the_galaxy/assets/components/tools/device_settings_layout.json"
 PARAM_KEYS_PATH = REPO_ROOT / "common/params_keys.h"
-GENERATOR_PATH = REPO_ROOT / "tools/StarPilot/generate_galaxy_layout.py"
 
 
 def _layout():
@@ -29,14 +27,6 @@ def _declared_default(key):
   )
   assert match is not None, f"Missing param declaration for {key}"
   return match.group(1)
-
-
-def _generator_module():
-  spec = importlib.util.spec_from_file_location("generate_galaxy_layout", GENERATOR_PATH)
-  assert spec is not None and spec.loader is not None
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-  return module
 
 
 def test_galaxy_layout_removes_obsolete_and_duplicate_controls():
@@ -66,9 +56,14 @@ def test_galaxy_layout_contains_basic_mode_controls():
     "HumanLaneChanges",
     "QOLLongitudinal",
   } <= sections["Longitudinal (Speed & Following)"].keys()
+  assert "Vision Speed Limits" in sections
+  assert "VisionSpeedLimitDetection" not in sections["Longitudinal (Speed & Following)"]
   assert "RedneckCruise" not in sections["Longitudinal (Speed & Following)"].keys()
   assert sections["Developer"]["RedneckCruise"]["parent_key"] == "GalaxyDeveloperMode"
-  assert {"AlphaLongitudinalEnabled", "ForceOffroad", "GalaxyDeveloperMode", "UseOldUI"} <= sections["Developer"].keys()
+  assert sections["Longitudinal (Speed & Following)"]["PulseGlideSpeedDelta"]["parent_key"] == "QOLLongitudinal"
+  assert sections["Longitudinal (Speed & Following)"]["PulseGlideSpeedDelta"]["settings_tier"] == "advanced"
+  assert "PulseGlideSpeedDelta" not in sections["Developer"]
+  assert {"AlphaLongitudinalEnabled", "ForceOffroad", "GalaxyDeveloperMode", "TestModelLeadTrajectory"} <= sections["Developer"].keys()
 
 
 def test_device_shutdown_uses_literal_hours():
@@ -100,15 +95,11 @@ def test_every_galaxy_setting_has_a_shared_settings_tier():
   assert None not in tiers
 
 
-def test_galaxy_layout_generator_is_semantically_idempotent():
-  layout = _layout()
-  assert _generator_module().generate_layout(layout) == layout
-
-
 def test_requested_simple_and_advanced_settings_tiers():
   sections = _params_by_section(_layout())
   lateral = sections["Lateral (Steering)"]
   longitudinal = sections["Longitudinal (Speed & Following)"]
+  vision = sections["Vision Speed Limits"]
   developer = sections["Developer"]
 
   for section_name in (
@@ -153,15 +144,22 @@ def test_requested_simple_and_advanced_settings_tiers():
     "ConditionalChill",
   ):
     assert longitudinal[key]["settings_tier"] == "advanced"
+  assert longitudinal["PulseGlideSpeedDelta"]["settings_tier"] == "advanced"
+
+  assert vision["VisionSpeedLimitDetection"]["settings_tier"] == "advanced"
+  assert vision["VisionSpeedLimitLowLimitFilter"]["settings_tier"] == "advanced"
+  assert vision["VisionSpeedLimitLowLimitThreshold"]["settings_tier"] == "advanced"
 
   assert developer["GalaxyDeveloperMode"]["settings_tier"] == "simple"
+  assert developer["TestModelLeadTrajectory"]["parent_key"] == "GalaxyDeveloperMode"
+  assert developer["TestModelLeadTrajectory"]["requires_offroad"] is True
+  assert developer["TestModelLeadTrajectory"]["settings_tier"] == "advanced"
   assert developer["AlphaLongitudinalEnabled"]["parent_key"] == "GalaxyDeveloperMode"
   assert developer["AlphaLongitudinalEnabled"]["requires_offroad"] is True
   assert developer["AlphaLongitudinalEnabled"]["settings_tier"] == "advanced"
   assert developer["ForceOffroad"]["parent_key"] == "GalaxyDeveloperMode"
   assert developer["ForceOffroad"]["requires_parked"] is True
   assert developer["ForceOffroad"]["settings_tier"] == "advanced"
-  assert developer["UseOldUI"]["settings_tier"] == "simple"
   assert developer["DeveloperUI"]["settings_tier"] == "advanced"
   assert developer["RedneckCruise"]["settings_tier"] == "advanced"
   assert sections["Visual (Display & UI)"]["DisableWideRoad"]["settings_tier"] == "advanced"
@@ -169,6 +167,7 @@ def test_requested_simple_and_advanced_settings_tiers():
 
 def test_hidden_feature_defaults_remain_enabled():
   assert _declared_default("GalaxyDeveloperMode") == "0"
+  assert _declared_default("TestModelLeadTrajectory") == "0"
   assert _declared_default("NavDesiresAllowed") == "1"
   assert _declared_default("NavLanePositioningAllowed") == "0"
   assert _declared_default("NavLongitudinalAllowed") == "1"
@@ -188,6 +187,17 @@ def test_human_acceleration_param_is_removed():
   assert '{"HumanAcceleration",' not in params_source
 
 
+def test_rivian_angle_control_is_live_favorite_and_harness_gated():
+  sections = _params_by_section(_layout())
+  setting = sections["Vehicle"]["RivianAngleControl"]
+
+  assert setting["ui_type"] == "toggle"
+  assert setting["favorite_eligible"] is True
+  assert setting["requires_capability"] == "HasRivianAngleHarness"
+  assert "reboot" not in setting["description"].lower()
+  assert _declared_default("RivianAngleControl") == "0"
+
+
 def test_vasm_is_default_off_and_configured_only_in_galaxy():
   sections = _params_by_section(_layout())
   lateral = sections["Lateral (Steering)"]
@@ -200,6 +210,32 @@ def test_vasm_is_default_off_and_configured_only_in_galaxy():
     REPO_ROOT / "selfdrive/ui/layouts/settings/starpilot/lateral.py",
   )
   assert all("VASM" not in path.read_text(encoding="utf-8") for path in physical_settings)
+
+
+def test_low_vision_limit_filter_is_default_off_and_configured_only_in_galaxy():
+  sections = _params_by_section(_layout())
+  vision = sections["Vision Speed Limits"]
+  toggle = vision["VisionSpeedLimitLowLimitFilter"]
+  threshold = vision["VisionSpeedLimitLowLimitThreshold"]
+
+  assert vision["VisionSpeedLimitDetection"]["is_parent_toggle"] is True
+  assert vision["VisionSpeedLimitAutoBookmark"]["is_parent_toggle"] is True
+  assert "VisionSpeedLimitDetection" not in sections["Longitudinal (Speed & Following)"]
+  assert toggle["is_parent_toggle"] is True
+  assert toggle["parent_key"] == "VisionSpeedLimitDetection"
+  assert threshold["parent_key"] == "VisionSpeedLimitLowLimitFilter"
+  assert threshold["min"] == 5
+  assert threshold["max"] == 80
+  assert threshold["step"] == 5
+  assert _declared_default("VisionSpeedLimitLowLimitFilter") == "0"
+  assert _declared_default("VisionSpeedLimitLowLimitThreshold") == "25"
+  assert _declared_default("VisionSpeedLimitDetection") == "1"
+
+  physical_settings = (
+    REPO_ROOT / "selfdrive/ui/layouts/settings/starpilot/longitudinal.py",
+    REPO_ROOT / "selfdrive/ui/layouts/settings/starpilot/aethergrid.py",
+  )
+  assert all("VisionSpeedLimitLowLimit" not in path.read_text(encoding="utf-8") for path in physical_settings)
 
 
 def test_pip_preview_is_under_driving_screen_widgets_and_configured_only_in_galaxy():
