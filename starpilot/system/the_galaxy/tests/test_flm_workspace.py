@@ -4,6 +4,7 @@ import math
 import sys
 import time
 
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -145,7 +146,11 @@ def _install_flm_import_stubs(tmp_path):
   sys.modules["openpilot.system.hardware"] = _simple_module("openpilot.system.hardware", PC=True)
   sys.modules["openpilot.system.hardware.hw"] = _simple_module(
     "openpilot.system.hardware.hw",
-    Paths=SimpleNamespace(comma_home=lambda: str(tmp_path), log_root=lambda **kwargs: str(tmp_path / "logs")),
+    Paths=SimpleNamespace(
+      comma_home=lambda: str(tmp_path),
+      log_root=lambda **kwargs: str(tmp_path / "logs"),
+      shm_path=lambda: str(tmp_path / "shm"),
+    ),
   )
   sys.modules["openpilot.tools.lib.logreader"] = _simple_module("openpilot.tools.lib.logreader", LogReader=lambda *args, **kwargs: [])
   sys.modules["openpilot.starpilot.common.lateral_delay"] = _simple_module(
@@ -205,6 +210,52 @@ def _sample(module, **kwargs):
   )
   base.update(kwargs)
   return module.FLMSample(**base)
+
+
+def test_live_sample_window_trim_is_in_place_and_bounded(monkeypatch, tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  monkeypatch.setattr(module, "FLM_LIVE_MAX_WINDOW_SECONDS", 1.0)
+  samples = deque([
+    _sample(module, t=0.0),
+    _sample(module, t=0.5),
+    _sample(module, t=1.0),
+    _sample(module, t=1.5),
+    _sample(module, t=2.0),
+  ])
+  original_id = id(samples)
+
+  removed = module._trim_live_samples(samples, 2.0)
+
+  assert id(samples) == original_id
+  assert removed == 2
+  assert [sample.t for sample in samples] == [1.0, 1.5, 2.0]
+
+
+def test_live_service_health_identifies_required_invalid_publisher(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  healthy = {service: True for service in module.FLM_LIVE_REQUIRED_SERVICES}
+  sm = SimpleNamespace(seen=dict(healthy), valid=dict(healthy), alive=dict(healthy), freq_ok=dict(healthy))
+
+  ready, faults = module._live_service_health(sm)
+  assert ready is True
+  assert faults == []
+
+  sm.valid["liveTorqueParameters"] = False
+  ready, faults = module._live_service_health(sm)
+  assert ready is False
+  assert faults == ["liveTorqueParameters:invalid"]
+
+
+def test_standard_toggle_reload_clears_live_runtime_overlay(tmp_path):
+  module, fake_params_cls = _load_flm_workspace_module(tmp_path)
+  runtime_path = module.live_flm_runtime_update_path(module.Paths.shm_path())
+  runtime_path.parent.mkdir(parents=True, exist_ok=True)
+  runtime_path.write_text('{"schemaVersion":1}', encoding="utf-8")
+
+  module._request_starpilot_toggle_reload()
+
+  assert not runtime_path.exists()
+  assert fake_params_cls._memory_store["StarPilotTogglesUpdated"] is True
 
 
 def _write_custom_trial_report(module, report_id="report-custom"):
@@ -2025,6 +2076,11 @@ def test_live_flm_revert_restores_exact_pre_live_saved_tune(tmp_path):
   assert changes["SteerLatAccel"]["to"] == pytest.approx(1.84)
   assert changes[symbol]["from"] == pytest.approx(0.14)
   assert changes[symbol]["to"] == pytest.approx(0.2)
+  runtime_update = json.loads(module.live_flm_runtime_update_path(module.Paths.shm_path()).read_text(encoding="utf-8"))
+  assert runtime_update["reason"] == "adjustment"
+  assert runtime_update["genericParams"]["SteerLatAccel"] == pytest.approx(1.84)
+  assert runtime_update["flmOverrides"]["vehicleKnobs"][symbol] == pytest.approx(0.2)
+  assert "StarPilotTogglesUpdated" not in fake_params_cls._memory_store
 
   module.revert_live_flm_tuning()
 
@@ -2033,6 +2089,10 @@ def test_live_flm_revert_restores_exact_pre_live_saved_tune(tmp_path):
   assert fake_params_cls._store[module.FLM_TRIAL_BASELINE_PARAM] == persistent_baseline
   assert json.loads((workspace["snapshots"] / "active.json").read_text(encoding="utf-8")) == active_snapshot
   assert not module._live_baseline_path(workspace).exists()
+  runtime_update = json.loads(module.live_flm_runtime_update_path(module.Paths.shm_path()).read_text(encoding="utf-8"))
+  assert runtime_update["reason"] == "manual-revert"
+  assert runtime_update["profileId"] == "saved:daily-driver"
+  assert runtime_update["genericParams"]["SteerLatAccel"] == pytest.approx(1.72)
 
 
 def test_save_live_flm_tune_finishes_session_in_standard_saved_tunes(tmp_path):

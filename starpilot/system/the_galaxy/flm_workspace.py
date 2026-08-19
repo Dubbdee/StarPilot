@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_vehicle_tunes import (
   normalize_flm_overrides,
 )
 from openpilot.starpilot.common.lateral_delay import full_lateral_delay
+from openpilot.starpilot.common.live_flm_runtime import clear_live_flm_runtime_update, live_flm_runtime_update_path
 from openpilot.system.hardware import PC
 from openpilot.system.hardware.hw import Paths
 from openpilot.tools.lib.logreader import LogReader
@@ -59,6 +61,19 @@ FLM_LIVE_MAX_WINDOW_SECONDS = 90.0
 FLM_LIVE_EVALUATION_INTERVAL_SECONDS = 10.0
 FLM_LIVE_STATUS_INTERVAL_SECONDS = 1.0
 FLM_LIVE_MIN_ELIGIBLE_SAMPLES = 500
+FLM_LIVE_MAX_BUFFER_SAMPLES = int(FLM_LIVE_MAX_WINDOW_SECONDS * 110)
+FLM_LIVE_HEALTH_ARM_SECONDS = 2.0
+FLM_LIVE_HEALTH_FAILURE_SECONDS = 1.25
+FLM_LIVE_SLOW_EVALUATION_SECONDS = 1.5
+FLM_LIVE_SLOW_EVALUATION_COOLDOWN_SECONDS = 30.0
+FLM_LIVE_REQUIRED_SERVICES = (
+  "controlsState",
+  "carState",
+  "carControl",
+  "carOutput",
+  "liveParameters",
+  "liveTorqueParameters",
+)
 FLM_UPLOAD_ROUTE_PREFIX = "upload:"
 FLM_UPLOAD_MAX_FILES = 64
 FLM_UPLOAD_MAX_FILE_BYTES = 512 * 1024 * 1024
@@ -1072,8 +1087,10 @@ def start_live_flm_tuning() -> dict[str, Any]:
       "eligibleSampleCount": 0,
       "windowSeconds": 0.0,
       "changeLog": list(previous_status.get("changeLog", []))[-60:] if resuming_session else [],
-      "liveTrace": list(previous_status.get("liveTrace", []))[-240:] if resuming_session else [],
       "startingTuneLabel": str(baseline.get("startingTuneLabel", "Current manual values") or "Current manual values"),
+      "healthArmed": False,
+      "healthFaults": [],
+      "lastEvaluationDurationMs": 0.0,
       "canResume": False,
       "canRevert": True,
     }
@@ -1166,16 +1183,13 @@ def stop_live_flm_tuning() -> bool:
     return stopped
 
 
-def revert_live_flm_tuning() -> dict[str, Any]:
-  stop_live_flm_tuning()
-  paths = ensure_flm_workspace()
+def _restore_live_flm_baseline(paths: dict[str, Path], baseline: dict[str, Any], params: Params, *, reason: str) -> None:
   baseline_path = _live_baseline_path(paths)
-  baseline = _read_json(baseline_path, {})
   if not isinstance(baseline, dict) or not isinstance(baseline.get("params"), dict):
     raise FileNotFoundError("live FLM baseline")
 
-  params = Params(return_defaults=True)
-  _apply_param_bundle(params, baseline["params"])
+  _apply_param_bundle(params, baseline["params"], notify=False)
+  _publish_live_flm_runtime_state(baseline["params"], str(baseline.get("sessionId", "") or ""), reason=reason)
   persistent_baseline = baseline.get("persistentTrialBaseline")
   if persistent_baseline is None:
     _clear_persistent_trial_baseline(params)
@@ -1196,6 +1210,17 @@ def revert_live_flm_tuning() -> dict[str, Any]:
     baseline_path.unlink()
   except FileNotFoundError:
     pass
+
+
+def revert_live_flm_tuning() -> dict[str, Any]:
+  stop_live_flm_tuning()
+  paths = ensure_flm_workspace()
+  baseline = _read_json(_live_baseline_path(paths), {})
+  if not isinstance(baseline, dict) or not isinstance(baseline.get("params"), dict):
+    raise FileNotFoundError("live FLM baseline")
+
+  params = Params(return_defaults=True)
+  _restore_live_flm_baseline(paths, baseline, params, reason="manual-revert")
 
   status = read_live_flm_status()
   _write_live_flm_status({
@@ -3002,8 +3027,39 @@ def _live_sample_from_messages(session_id: str, segment: int, timestamp: float, 
   )
 
 
-def _live_window_seconds(samples: list[FLMSample]) -> float:
+def _live_window_seconds(samples) -> float:
   return max(float(samples[-1].t - samples[0].t), 0.0) if len(samples) >= 2 else 0.0
+
+
+def _trim_live_samples(samples: deque[FLMSample], newest_time: float) -> int:
+  """Drop expired samples in O(number expired), without copying the live window."""
+  cutoff = float(newest_time) - FLM_LIVE_MAX_WINDOW_SECONDS
+  removed = 0
+  while samples and samples[0].t < cutoff:
+    samples.popleft()
+    removed += 1
+  return removed
+
+
+def _live_service_health(sm) -> tuple[bool, list[str]]:
+  seen = getattr(sm, "seen", {})
+  valid = getattr(sm, "valid", {})
+  alive = getattr(sm, "alive", {})
+  freq_ok = getattr(sm, "freq_ok", {})
+  faults = []
+
+  for service in FLM_LIVE_REQUIRED_SERVICES:
+    if not bool(seen.get(service, False)):
+      faults.append(f"{service}:not_seen")
+      continue
+    if not bool(valid.get(service, True)):
+      faults.append(f"{service}:invalid")
+    if not bool(alive.get(service, True)):
+      faults.append(f"{service}:not_alive")
+    if not bool(freq_ok.get(service, True)):
+      faults.append(f"{service}:frequency")
+
+  return not faults, faults
 
 
 def _build_live_adjustment_plan(samples: list[FLMSample], car_params, params: Params,
@@ -4249,7 +4305,7 @@ def clear_workspace() -> dict[str, Any]:
     params.put("FLMActiveProfileId", "")
     params.put("FLMActiveOverrides", {})
     _clear_persistent_trial_baseline(params)
-    Params(memory=True).put_bool("StarPilotTogglesUpdated", True)
+    _request_starpilot_toggle_reload()
 
   removed = []
   for key in ("reports", "profiles", "feedback", "snapshots"):
@@ -4315,7 +4371,11 @@ def _read_persistent_trial_baseline(params: Params) -> dict[str, Any] | None:
 
 
 def _persist_trial_baseline(params: Params, snapshot: dict[str, Any]) -> None:
-  if isinstance(snapshot.get("params"), dict) and not snapshot["params"].get("FLMTrialApplied", False):
+  if (
+    isinstance(snapshot.get("params"), dict)
+    and not snapshot["params"].get("FLMTrialApplied", False)
+    and _read_persistent_trial_baseline(params) is None
+  ):
     params.put(FLM_TRIAL_BASELINE_PARAM, snapshot)
 
 
@@ -4367,7 +4427,31 @@ def _recover_report_baseline(paths: dict[str, Path], profile_id: str,
   return None
 
 
-def _apply_param_bundle(params: Params, bundle: dict[str, Any]) -> None:
+def _publish_live_flm_runtime_state(state: dict[str, Any], session_id: str, *, reason: str) -> dict[str, Any]:
+  payload = {
+    "schemaVersion": 1,
+    "updateId": f"{session_id}:{time.time_ns()}",
+    "sessionId": str(session_id or ""),
+    "reason": str(reason or "live-flm"),
+    "profileId": str(state.get("FLMActiveProfileId", "") or ""),
+    "trialApplied": bool(state.get("FLMTrialApplied", False)),
+    "genericParams": {
+      key: state[key]
+      for key in FLM_ADVANCED_LATERAL_PARAM_KEYS
+      if key in state
+    },
+    "flmOverrides": normalize_flm_overrides(state.get("FLMActiveOverrides", {})),
+  }
+  _write_json(live_flm_runtime_update_path(Paths.shm_path()), payload)
+  return payload
+
+
+def _request_starpilot_toggle_reload() -> None:
+  clear_live_flm_runtime_update(live_flm_runtime_update_path(Paths.shm_path()))
+  Params(memory=True).put_bool("StarPilotTogglesUpdated", True)
+
+
+def _apply_param_bundle(params: Params, bundle: dict[str, Any], *, notify: bool = True) -> None:
   for key, value in bundle.items():
     kind = TRIAL_PARAM_SPECS.get(key)
     if kind == "bool":
@@ -4379,7 +4463,8 @@ def _apply_param_bundle(params: Params, bundle: dict[str, Any]) -> None:
     elif kind == "string":
       params.put(key, str(value or ""))
 
-  Params(memory=True).put_bool("StarPilotTogglesUpdated", True)
+  if notify:
+    _request_starpilot_toggle_reload()
 
 
 def _merge_flm_override_state(base: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
@@ -4465,10 +4550,18 @@ def _apply_live_flm_profile(profile: dict[str, Any], plan: dict[str, Any]) -> di
   _write_json(active_snapshot_path, snapshot)
   _persist_trial_baseline(params, snapshot)
 
-  bundle = dict(profile.get("genericParams", {}))
-  bundle["FLMActiveProfileId"] = snapshot["profileId"]
-  bundle["FLMActiveOverrides"] = merged_overrides
-  bundle["FLMTrialApplied"] = True
+  runtime_state = {
+    **current_state,
+    **dict(profile.get("genericParams", {})),
+    "FLMActiveProfileId": snapshot["profileId"],
+    "FLMActiveOverrides": merged_overrides,
+    "FLMTrialApplied": True,
+  }
+  bundle = {
+    key: value
+    for key, value in runtime_state.items()
+    if key in TRIAL_PARAM_SPECS and current_state.get(key) != value
+  }
 
   changes = []
   for key, next_value in profile.get("genericParams", {}).items():
@@ -4487,7 +4580,11 @@ def _apply_live_flm_profile(profile: dict[str, Any], plan: dict[str, Any]) -> di
     if previous_value != next_value:
       changes.append({"key": symbol, "from": previous_value, "to": next_value})
 
-  _apply_param_bundle(params, bundle)
+  # Persist only values that changed, then send one compact runtime update to
+  # starpilot_process. A normal StarPilot toggle refresh reads hundreds of
+  # Params and can starve onroad publishers when repeated by Live FLM.
+  _apply_param_bundle(params, bundle, notify=False)
+  _publish_live_flm_runtime_state(runtime_state, session_id, reason="adjustment")
 
   if plan.get("pathKey") == "cleanup_pass" and plan.get("carFingerprint"):
     _record_cleanup_progress(str(plan["carFingerprint"]), "live-flm")
@@ -5059,7 +5156,7 @@ def revert_trial_profile() -> dict[str, Any]:
       snapshot_path.unlink()
     except FileNotFoundError:
       pass
-    Params(memory=True).put_bool("StarPilotTogglesUpdated", True)
+    _request_starpilot_toggle_reload()
     return {"message": "Recovered the incomplete FLM trial; no rollback snapshot was available.", "recovered": True}
   _apply_param_bundle(params, revert_snapshot["params"])
   _clear_persistent_trial_baseline(params)
@@ -5088,7 +5185,7 @@ def accept_trial_as_baseline() -> dict[str, Any]:
   params.put_bool("FLMTrialApplied", False)
   params.put("FLMActiveProfileId", "")
   _clear_persistent_trial_baseline(params)
-  Params(memory=True).put_bool("StarPilotTogglesUpdated", True)
+  _request_starpilot_toggle_reload()
   for path in paths["snapshots"].glob("*.json"):
     path.unlink()
 
@@ -5218,7 +5315,7 @@ def run_live_worker(session_id: str) -> None:
   previous_status = read_live_flm_status()
   started_at = float(previous_status.get("startedAt", time.time()) or time.time())
   adjustment_count = int(previous_status.get("adjustmentCount", 0) or 0)
-  samples: list[FLMSample] = []
+  samples: deque[FLMSample] = deque(maxlen=FLM_LIVE_MAX_BUFFER_SAMPLES)
   pending_plan: dict[str, Any] | None = None
   road_segment = 0
   onroad = params.get_bool("IsOnroad")
@@ -5227,6 +5324,13 @@ def run_live_worker(session_id: str) -> None:
   last_evaluation = time.monotonic()
   collect_after = 0.0
   last_status_write = 0.0
+  evaluation_cooldown_until = 0.0
+  last_evaluation_duration_ms = 0.0
+  max_evaluation_duration_ms = 0.0
+  health_armed = False
+  health_good_since = 0.0
+  health_fault_since = 0.0
+  health_faults: list[str] = []
   state = "observing" if onroad else "waiting_onroad"
   message = "Collecting a fresh evidence window." if onroad else "Waiting for the vehicle to go onroad."
   latest_stats: dict[str, Any] = {}
@@ -5235,14 +5339,15 @@ def run_live_worker(session_id: str) -> None:
   last_buckets: list[str] = []
   last_path_label = ""
   starting_tune_label = str(baseline.get("startingTuneLabel", "Current manual values") or "Current manual values")
-  change_log = [item for item in previous_status.get("changeLog", []) if isinstance(item, dict)][-60:]
-  live_trace = [item for item in previous_status.get("liveTrace", []) if isinstance(item, dict)][-240:]
-  last_trace_sample = float(live_trace[-1].get("t", 0.0) or 0.0) if live_trace else 0.0
+  change_log = deque(
+    [item for item in previous_status.get("changeLog", []) if isinstance(item, dict)][-60:],
+    maxlen=60,
+  )
   persistent_car_params = params.get("CarParamsPersistent")
 
   try:
     sm = messaging.SubMaster(
-      ["controlsState", "carState", "carControl", "carOutput", "liveParameters", "carParams"],
+      ["controlsState", "carState", "carControl", "carOutput", "liveParameters", "liveTorqueParameters", "carParams"],
       poll="controlsState",
     )
     while True:
@@ -5260,123 +5365,186 @@ def run_live_worker(session_id: str) -> None:
         samples.clear()
         pending_plan = None
         collect_after = 0.0
+        evaluation_cooldown_until = 0.0
+        health_armed = False
+        health_good_since = 0.0
+        health_fault_since = 0.0
+        health_faults = []
         latest_stats = {}
         state = "waiting_onroad"
         message = "Waiting for the vehicle to go onroad."
-      elif bool(getattr(sm, "updated", {}).get("controlsState", False)):
-        if not was_onroad:
-          live_trace = []
-          last_trace_sample = 0.0
-        was_onroad = True
-        controls_state = sm["controlsState"]
-        car_state = sm["carState"]
-        car_control = sm["carControl"]
-        car_params = sm["carParams"]
-        timestamp = float(getattr(sm, "logMonoTime", {}).get("controlsState", 0) or 0) / 1e9
-        if timestamp <= 0.0:
-          timestamp = monotonic_now
-        sample = _live_sample_from_messages(
-          session_id,
-          road_segment,
-          timestamp,
-          controls_state,
-          car_state,
-          car_control,
-          sm["carOutput"],
-          sm["liveParameters"],
-        )
-
-        car_fingerprint = str(getattr(car_params, "carFingerprint", "") or "")
-        if not car_fingerprint and not persistent_car_params:
-          persistent_car_params = params.get("CarParamsPersistent")
-        if sample is None or (not car_fingerprint and not persistent_car_params):
-          state = "waiting_for_torque_control"
-          message = "Waiting for live torque-controller and car-parameter data."
+      else:
+        services_healthy, health_faults = _live_service_health(sm)
+        if services_healthy:
+          health_fault_since = 0.0
+          if health_good_since <= 0.0:
+            health_good_since = monotonic_now
+          if not health_armed and monotonic_now - health_good_since >= FLM_LIVE_HEALTH_ARM_SECONDS:
+            health_armed = True
         else:
-          samples.append(sample)
-          if sample.t - last_trace_sample >= 0.25:
-            live_trace.append({
-              "t": round(sample.t, 2),
-              "desired": round(sample.desired_la, 4),
-              "actual": round(sample.actual_la, 4),
-            })
-            live_trace = live_trace[-240:]
-            last_trace_sample = sample.t
-          settling = monotonic_now < collect_after
-          if settling:
+          health_good_since = 0.0
+          if health_armed and health_fault_since <= 0.0:
+            health_fault_since = monotonic_now
+
+        if health_armed and health_fault_since > 0.0 and monotonic_now - health_fault_since >= FLM_LIVE_HEALTH_FAILURE_SECONDS:
+          fault_summary = ", ".join(health_faults) or "required onroad messages"
+          _restore_live_flm_baseline(paths, baseline, params, reason="health-guard")
+          _write_live_flm_status({
+            "pid": 0,
+            "sessionId": session_id,
+            "startedAt": started_at,
+            "running": False,
+            "state": "safety_reverted",
+            "message": f"Live FLM stopped and restored the pre-live tune because {fault_summary} became unhealthy.",
+            "adjustmentCount": adjustment_count,
+            "sampleCount": 0,
+            "eligibleSampleCount": 0,
+            "windowSeconds": 0.0,
+            "changeLog": list(change_log),
+            "healthArmed": True,
+            "healthFaults": health_faults,
+            "lastEvaluationDurationMs": last_evaluation_duration_ms,
+            "maxEvaluationDurationMs": max_evaluation_duration_ms,
+            "lastChangedKeys": last_changed_keys,
+            "lastBuckets": last_buckets,
+            "lastPathLabel": last_path_label,
+            "startingTuneLabel": starting_tune_label,
+            "canResume": False,
+            "canRevert": False,
+          })
+          return
+
+        if not health_armed or not services_healthy:
+          samples.clear()
+          pending_plan = None
+          collect_after = 0.0
+          if services_healthy:
+            state = "arming_health_guard"
+            message = "Verifying stable onroad processes before collecting Live FLM evidence."
+          else:
+            state = "waiting_for_healthy_processes"
+            message = "Waiting for required onroad processes before collecting Live FLM evidence."
+        elif bool(getattr(sm, "updated", {}).get("controlsState", False)):
+          if not was_onroad:
             samples.clear()
-            state = "settling"
-            message = "Waiting for the newly applied values to reach the controller before collecting fresh evidence."
-          cutoff = sample.t - FLM_LIVE_MAX_WINDOW_SECONDS
-          if samples and samples[0].t < cutoff:
-            first_kept = next((idx for idx, item in enumerate(samples) if item.t >= cutoff), len(samples))
-            samples = samples[first_kept:]
+          was_onroad = True
+          controls_state = sm["controlsState"]
+          car_state = sm["carState"]
+          car_control = sm["carControl"]
+          car_params = sm["carParams"]
+          timestamp = float(getattr(sm, "logMonoTime", {}).get("controlsState", 0) or 0) / 1e9
+          if timestamp <= 0.0:
+            timestamp = monotonic_now
+          sample = _live_sample_from_messages(
+            session_id,
+            road_segment,
+            timestamp,
+            controls_state,
+            car_state,
+            car_control,
+            sm["carOutput"],
+            sm["liveParameters"],
+          )
 
-          window_seconds = _live_window_seconds(samples)
-          if not settling and pending_plan is None and window_seconds < FLM_LIVE_MIN_WINDOW_SECONDS:
-            state = "observing"
-            message = f"Collecting a fresh {FLM_LIVE_MIN_WINDOW_SECONDS:.0f}-second evidence window."
+          car_fingerprint = str(getattr(car_params, "carFingerprint", "") or "")
+          if not car_fingerprint and not persistent_car_params:
+            persistent_car_params = params.get("CarParamsPersistent")
+          if sample is None or (not car_fingerprint and not persistent_car_params):
+            samples.clear()
+            state = "waiting_for_torque_control"
+            message = "Waiting for live torque-controller and car-parameter data."
+          else:
+            samples.append(sample)
+            settling = monotonic_now < collect_after
+            if settling:
+              samples.clear()
+              state = "settling"
+              message = "Waiting for the newly applied values to reach the controller before collecting fresh evidence."
+            _trim_live_samples(samples, sample.t)
 
-          if (
-            pending_plan is None
-            and not settling
-            and window_seconds >= FLM_LIVE_MIN_WINDOW_SECONDS
-            and monotonic_now - last_evaluation >= FLM_LIVE_EVALUATION_INTERVAL_SECONDS
-          ):
-            state = "evaluating"
-            message = "Evaluating desired-versus-actual lateral behavior with FLM."
-            last_evaluation = monotonic_now
-            if car_fingerprint:
-              plan = _build_live_adjustment_plan(samples, car_params, params, session_id, adjustment_count)
-            else:
-              with car.CarParams.from_bytes(persistent_car_params) as stored_car_params:
-                plan = _build_live_adjustment_plan(samples, stored_car_params, params, session_id, adjustment_count)
-            latest_stats = dict(plan.get("summaryStats", {}))
-            last_step = dict(plan.get("step", {}))
-            last_buckets = list(plan.get("actionableBuckets", []))
-            last_path_label = str(plan.get("pathLabel", "") or "")
-            if int(latest_stats.get("sampleCount", 0) or 0) < FLM_LIVE_MIN_ELIGIBLE_SAMPLES:
+            window_seconds = _live_window_seconds(samples)
+            cooling_down = monotonic_now < evaluation_cooldown_until
+            if cooling_down and not settling:
+              state = "cooling_down"
+              message = "The last analysis was slow, so Live FLM is yielding resources before trying again."
+            elif not settling and pending_plan is None and window_seconds < FLM_LIVE_MIN_WINDOW_SECONDS:
               state = "observing"
-              message = "More lateral-control evidence is needed before changing the tune."
-            elif plan.get("profile") is None:
-              if last_step.get("profileKey"):
-                state = "at_limit"
-                message = "FLM found a mismatch, but no supported value can move further at this step size."
-              else:
-                state = "synced"
-                message = "No actionable mismatch is present in the current FLM evidence window."
-            else:
-              pending_plan = plan
-              state = "applying"
-              message = "Applying the adaptive FLM adjustment immediately."
+              message = f"Collecting a fresh {FLM_LIVE_MIN_WINDOW_SECONDS:.0f}-second evidence window."
 
-          if pending_plan is not None:
-            apply_result = _apply_live_flm_profile(pending_plan["profile"], pending_plan)
-            adjustment_count += 1
-            last_changed_keys = list(apply_result.get("changedKeys", []))
-            last_step = dict(pending_plan.get("step", {}))
-            for change in apply_result.get("changes", []):
-              if not isinstance(change, dict):
-                continue
-              change_log.append({
-                **change,
-                "at": time.time(),
-                "adjustment": adjustment_count,
-                "stepLabel": str(last_step.get("profileLabel", "") or ""),
-              })
-            change_log = change_log[-60:]
-            latest_stats = dict(pending_plan.get("summaryStats", {}))
-            last_buckets = list(pending_plan.get("actionableBuckets", []))
-            last_path_label = str(pending_plan.get("pathLabel", "") or "")
-            message = (
-              f"Applied a {last_step.get('profileLabel', 'FLM')} step. "
-              "Collecting entirely fresh evidence before the next adjustment."
-            )
-            state = "observing"
-            pending_plan = None
-            samples.clear()
-            last_evaluation = monotonic_now
-            collect_after = monotonic_now + 3.0
+            if (
+              pending_plan is None
+              and not settling
+              and not cooling_down
+              and window_seconds >= FLM_LIVE_MIN_WINDOW_SECONDS
+              and monotonic_now - last_evaluation >= FLM_LIVE_EVALUATION_INTERVAL_SECONDS
+            ):
+              state = "evaluating"
+              message = "Evaluating desired-versus-actual lateral behavior with FLM."
+              last_evaluation = monotonic_now
+              evaluation_started = time.monotonic()
+              analysis_samples = list(samples)
+              if car_fingerprint:
+                plan = _build_live_adjustment_plan(analysis_samples, car_params, params, session_id, adjustment_count)
+              else:
+                with car.CarParams.from_bytes(persistent_car_params) as stored_car_params:
+                  plan = _build_live_adjustment_plan(analysis_samples, stored_car_params, params, session_id, adjustment_count)
+              monotonic_now = time.monotonic()
+              last_evaluation_duration_ms = (monotonic_now - evaluation_started) * 1000.0
+              max_evaluation_duration_ms = max(max_evaluation_duration_ms, last_evaluation_duration_ms)
+              latest_stats = dict(plan.get("summaryStats", {}))
+              last_step = dict(plan.get("step", {}))
+              last_buckets = list(plan.get("actionableBuckets", []))
+              last_path_label = str(plan.get("pathLabel", "") or "")
+
+              if last_evaluation_duration_ms > FLM_LIVE_SLOW_EVALUATION_SECONDS * 1000.0:
+                pending_plan = None
+                evaluation_cooldown_until = monotonic_now + FLM_LIVE_SLOW_EVALUATION_COOLDOWN_SECONDS
+                state = "cooling_down"
+                message = (
+                  f"FLM analysis took {last_evaluation_duration_ms / 1000.0:.1f}s, so no values were applied. "
+                  "Yielding resources before another attempt."
+                )
+              elif int(latest_stats.get("sampleCount", 0) or 0) < FLM_LIVE_MIN_ELIGIBLE_SAMPLES:
+                state = "observing"
+                message = "More lateral-control evidence is needed before changing the tune."
+              elif plan.get("profile") is None:
+                if last_step.get("profileKey"):
+                  state = "at_limit"
+                  message = "FLM found a mismatch, but no supported value can move further at this step size."
+                else:
+                  state = "synced"
+                  message = "No actionable mismatch is present in the current FLM evidence window."
+              else:
+                pending_plan = plan
+                state = "applying"
+                message = "Applying the adaptive FLM adjustment immediately."
+
+            if pending_plan is not None:
+              apply_result = _apply_live_flm_profile(pending_plan["profile"], pending_plan)
+              adjustment_count += 1
+              last_changed_keys = list(apply_result.get("changedKeys", []))
+              last_step = dict(pending_plan.get("step", {}))
+              for change in apply_result.get("changes", []):
+                if not isinstance(change, dict):
+                  continue
+                change_log.append({
+                  **change,
+                  "at": time.time(),
+                  "adjustment": adjustment_count,
+                  "stepLabel": str(last_step.get("profileLabel", "") or ""),
+                })
+              latest_stats = dict(pending_plan.get("summaryStats", {}))
+              last_buckets = list(pending_plan.get("actionableBuckets", []))
+              last_path_label = str(pending_plan.get("pathLabel", "") or "")
+              message = (
+                f"Applied a {last_step.get('profileLabel', 'FLM')} step. "
+                "Collecting entirely fresh evidence before the next adjustment."
+              )
+              state = "observing"
+              pending_plan = None
+              samples.clear()
+              last_evaluation = monotonic_now
+              collect_after = monotonic_now + 3.0
 
       if monotonic_now - last_status_write >= FLM_LIVE_STATUS_INTERVAL_SECONDS:
         approximate_eligible = sum(1 for sample in samples if sample.lat_active and not sample.steering_pressed)
@@ -5398,27 +5566,40 @@ def run_live_worker(session_id: str) -> None:
           "lastStepMultiplier": float(last_step.get("multiplier", 0.0) or 0.0),
           "lastStepReason": str(last_step.get("reason", "") or ""),
           "lastChangedKeys": last_changed_keys,
-          "changeLog": change_log,
-          "liveTrace": live_trace,
+          "changeLog": list(change_log),
           "lastBuckets": last_buckets,
           "lastPathLabel": last_path_label,
           "startingTuneLabel": starting_tune_label,
           "pendingAdjustment": pending_plan is not None,
+          "healthArmed": health_armed,
+          "healthFaults": health_faults,
+          "lastEvaluationDurationMs": round(last_evaluation_duration_ms, 1),
+          "maxEvaluationDurationMs": round(max_evaluation_duration_ms, 1),
+          "evaluationCooldownSeconds": round(max(evaluation_cooldown_until - monotonic_now, 0.0), 1),
+          "bufferCapacity": FLM_LIVE_MAX_BUFFER_SAMPLES,
           "canResume": False,
           "canRevert": True,
         })
         last_status_write = monotonic_now
   except Exception as error:
     status = read_live_flm_status()
+    restored = False
+    restore_error = ""
+    try:
+      if _live_baseline_path(paths).is_file():
+        _restore_live_flm_baseline(paths, baseline, params, reason="worker-error")
+        restored = True
+    except Exception as rollback_error:
+      restore_error = f"; rollback failed: {type(rollback_error).__name__}: {rollback_error}"
     _write_live_flm_status({
       **status,
       "pid": 0,
       "running": False,
-      "state": "failed",
-      "message": "Live FLM stopped after an internal error.",
-      "error": f"{type(error).__name__}: {error}",
-      "canResume": True,
-      "canRevert": _live_baseline_path(paths).is_file(),
+      "state": "failed_reverted" if restored else "failed",
+      "message": "Live FLM stopped after an internal error and restored the pre-live tune." if restored else "Live FLM stopped after an internal error.",
+      "error": f"{type(error).__name__}: {error}{restore_error}",
+      "canResume": not restored,
+      "canRevert": not restored and _live_baseline_path(paths).is_file(),
     })
     raise
 

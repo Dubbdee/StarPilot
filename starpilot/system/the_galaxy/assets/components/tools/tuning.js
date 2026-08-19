@@ -129,42 +129,6 @@ function formatLiveChangeTime(timestamp) {
   return Number.isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString()
 }
 
-function renderLiveFlmGraph() {
-  const trace = Array.isArray(state.liveStatus?.liveTrace) ? state.liveStatus.liveTrace : []
-  if (trace.length < 2) {
-    return html`<div class="flmLiveGraphEmpty">The desired/actual graph appears after Live FLM receives torque-control samples.</div>`
-  }
-
-  const width = 720
-  const height = 176
-  const paddingX = 20
-  const paddingY = 18
-  const firstTime = safeCount(trace[0]?.t)
-  const lastTime = safeCount(trace[trace.length - 1]?.t)
-  const timeSpan = Math.max(lastTime - firstTime, 0.25)
-  const maxAbs = Math.max(
-    0.25,
-    ...trace.flatMap(point => [Math.abs(safeCount(point?.desired)), Math.abs(safeCount(point?.actual))]),
-  )
-  const x = point => paddingX + ((safeCount(point?.t) - firstTime) / timeSpan) * (width - paddingX * 2)
-  const y = value => (height / 2) - (safeCount(value) / maxAbs) * ((height / 2) - paddingY)
-  const desiredPoints = trace.map(point => `${x(point).toFixed(1)},${y(point?.desired).toFixed(1)}`).join(" ")
-  const actualPoints = trace.map(point => `${x(point).toFixed(1)},${y(point?.actual).toFixed(1)}`).join(" ")
-
-  return html`
-    <div class="flmLiveGraphHeader">
-      <span><i class="flmLiveLegend desired"></i>Desired lateral accel</span>
-      <span><i class="flmLiveLegend actual"></i>Actual lateral accel</span>
-      <span class="longManeuverMuted">±${maxAbs.toFixed(2)} m/s² / latest ${Math.round(timeSpan)}s</span>
-    </div>
-    <svg class="flmLiveGraphSvg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Live desired and actual lateral acceleration">
-      <line class="flmLiveGraphZero" x1="${paddingX}" y1="${height / 2}" x2="${width - paddingX}" y2="${height / 2}"></line>
-      <polyline class="flmLiveGraphLine desired" points="${desiredPoints}"></polyline>
-      <polyline class="flmLiveGraphLine actual" points="${actualPoints}"></polyline>
-    </svg>
-  `
-}
-
 function renderLiveChangeLog() {
   const changes = Array.isArray(state.liveStatus?.changeLog) ? [...state.liveStatus.changeLog].reverse() : []
   if (!changes.length) {
@@ -1850,10 +1814,6 @@ export function Tuning() {
             <p><strong>Latest Step:</strong> ${() => state.liveStatus?.lastStepLabel ? `${state.liveStatus.lastStepLabel} (${safeCount(state.liveStatus.lastStepMultiplier).toFixed(2)}×)` : "Waiting"}</p>
             <p><strong>Mean Tracking Error:</strong> ${() => state.liveStatus?.meanErrorAbs == null ? "Waiting" : safeCount(state.liveStatus.meanErrorAbs).toFixed(4)}</p>
             <p><strong>Path:</strong> ${() => state.liveStatus?.lastPathLabel || "Waiting"}</p>
-          </div>
-          <div class="flmCardSubsection flmLiveGraph">
-            <h4>Desired vs Actual</h4>
-            ${() => renderLiveFlmGraph()}
           </div>
           <p>${() => state.liveStatus?.message || "Start Live FLM now or while parked; it waits for onroad torque-control evidence."}</p>
           <p class="longManeuverMuted">
