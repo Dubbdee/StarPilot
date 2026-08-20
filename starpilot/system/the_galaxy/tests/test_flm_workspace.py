@@ -286,30 +286,6 @@ def test_live_service_health_uses_twenty_hz_aware_core_checks(tmp_path):
   assert faults == ["carState:stale"]
 
 
-def test_live_torque_health_waits_for_valid_data_then_detects_runtime_faults(tmp_path):
-  module, _ = _load_flm_workspace_module(tmp_path)
-  service = module.FLM_LIVE_TORQUE_SERVICE
-  sm = SimpleNamespace(
-    seen={service: True},
-    valid={service: False},
-    recv_time={service: 9.9},
-  )
-
-  ready, faults = module._live_torque_health(sm, 10.0)
-  assert ready is False
-  assert faults == [f"{service}:invalid"]
-
-  sm.valid[service] = True
-  ready, faults = module._live_torque_health(sm, 10.0)
-  assert ready is True
-  assert faults == []
-
-  sm.recv_time[service] = 8.99
-  ready, faults = module._live_torque_health(sm, 10.0)
-  assert ready is False
-  assert faults == [f"{service}:stale"]
-
-
 def test_live_health_guard_times_out_before_arming(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
 
@@ -319,10 +295,10 @@ def test_live_health_guard_times_out_before_arming(tmp_path):
   assert module._live_health_failure_kind(True, 10.0, 20.0, 21.25) == "runtime"
 
 
-def test_live_worker_continues_while_torque_health_monitor_warms_up(monkeypatch, tmp_path):
+def test_live_worker_ignores_torque_estimator_validity(monkeypatch, tmp_path):
   module, fake_params_cls = _load_flm_workspace_module(tmp_path)
   module.FLM_LIVE_STATUS_PATH = tmp_path / "live_status.json"
-  session_id = "live-torque-warmup"
+  session_id = "live-ignore-torque-validity"
   module._write_json(module._live_baseline_path(), {
     "sessionId": session_id,
     "startingTuneLabel": "Test tune",
@@ -330,12 +306,15 @@ def test_live_worker_continues_while_torque_health_monitor_warms_up(monkeypatch,
   fake_params_cls._store = {"IsOnroad": True}
 
   clock = SimpleNamespace(now=100.0)
+  subscribed_services = []
 
   class FakeSubMaster:
     def __init__(self, services, **_kwargs):
+      subscribed_services.extend(services)
       self.seen = dict.fromkeys(services, True)
       self.valid = dict.fromkeys(services, True)
-      self.valid[module.FLM_LIVE_TORQUE_SERVICE] = False
+      self.seen["liveTorqueParameters"] = True
+      self.valid["liveTorqueParameters"] = False
       self.alive = dict.fromkeys(services, False)
       self.freq_ok = dict.fromkeys(services, False)
       self.recv_time = dict.fromkeys(services, clock.now)
@@ -363,11 +342,11 @@ def test_live_worker_continues_while_torque_health_monitor_warms_up(monkeypatch,
 
   status = module.read_live_flm_status()
   assert restored == []
+  assert "liveTorqueParameters" not in subscribed_services
   assert status["running"] is True
-  assert status["state"] == "observing"
-  assert status["coreHealthArmed"] is True
-  assert status["torqueHealthArmed"] is False
+  assert status["state"] in {"arming_health_guard", "observing"}
   assert status["healthArmed"] is True
+  assert "torqueHealthArmed" not in status
 
 
 def test_live_worker_uses_low_rate_subscriber_and_reverts_unhealthy_startup(monkeypatch, tmp_path):
