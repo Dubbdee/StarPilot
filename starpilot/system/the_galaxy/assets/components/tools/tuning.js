@@ -1815,7 +1815,7 @@ export function Tuning() {
             <p><strong>Mean Tracking Error:</strong> ${() => state.liveStatus?.meanErrorAbs == null ? "Waiting" : safeCount(state.liveStatus.meanErrorAbs).toFixed(4)}</p>
             <p><strong>Path:</strong> ${() => state.liveStatus?.lastPathLabel || "Waiting"}</p>
           </div>
-          <p>${() => state.liveStatus?.message || "Start Live FLM now or while parked; it waits for onroad torque-control evidence."}</p>
+          <p>${() => state.liveStatus?.message || "Start Live FLM whenever needed; it loads at low priority on background cores, then tunes from fresh onroad torque-control evidence."}</p>
           <p class="longManeuverMuted">
             The active values survive ignition cycles. Stop & Save Tune also stores the result in the regular Saved Tunes list and finishes this live session.
           </p>

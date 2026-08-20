@@ -60,10 +60,15 @@ FLM_LIVE_MIN_WINDOW_SECONDS = 30.0
 FLM_LIVE_MAX_WINDOW_SECONDS = 90.0
 FLM_LIVE_EVALUATION_INTERVAL_SECONDS = 10.0
 FLM_LIVE_STATUS_INTERVAL_SECONDS = 1.0
-FLM_LIVE_MIN_ELIGIBLE_SAMPLES = 500
-FLM_LIVE_SAMPLE_RATE_HZ = 20.0
+FLM_LIVE_SAMPLE_RATE_HZ = 10.0
+FLM_LIVE_MIN_ELIGIBLE_SECONDS = 25.0
+FLM_LIVE_MIN_ELIGIBLE_SAMPLES = int(math.ceil(FLM_LIVE_MIN_ELIGIBLE_SECONDS * FLM_LIVE_SAMPLE_RATE_HZ))
 FLM_LIVE_SAMPLE_INTERVAL_SECONDS = 1.0 / FLM_LIVE_SAMPLE_RATE_HZ
 FLM_LIVE_MAX_BUFFER_SAMPLES = int(math.ceil(FLM_LIVE_MAX_WINDOW_SECONDS * FLM_LIVE_SAMPLE_RATE_HZ)) + 2
+# Keep this best-effort, nice-19 worker away from the dedicated onroad cores:
+# control (4), planning/radar (5), camera (6), and model (7). Cores 1-2 are
+# available while parked too, so heavyweight imports are isolated from startup.
+FLM_LIVE_BACKGROUND_AFFINITY_CORES = (1, 2)
 FLM_LIVE_HEALTH_ARM_SECONDS = 2.0
 FLM_LIVE_HEALTH_STARTUP_TIMEOUT_SECONDS = 5.0
 FLM_LIVE_HEALTH_FAILURE_SECONDS = 1.25
@@ -443,11 +448,34 @@ def _worker_env(repo_root: Path) -> dict[str, str]:
   if env.get("PYTHONPATH"):
     pythonpath.append(env["PYTHONPATH"])
   env["PYTHONPATH"] = os.pathsep.join(pythonpath)
-  env.setdefault("OPENBLAS_NUM_THREADS", "1")
-  env.setdefault("OMP_NUM_THREADS", "1")
-  env.setdefault("MKL_NUM_THREADS", "1")
-  env.setdefault("NUMEXPR_NUM_THREADS", "1")
+  for variable in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    env[variable] = "1"
+  env["OMP_WAIT_POLICY"] = "PASSIVE"
+  env["MALLOC_ARENA_MAX"] = "1"
   return env
+
+
+def _live_worker_command(session_id: str) -> list[str]:
+  command = [
+    "nice",
+    "-n",
+    "19",
+    sys.executable or "python3",
+    str(Path(__file__).resolve()),
+    "live-worker",
+    str(session_id),
+  ]
+  if not PC:
+    core_list = ",".join(str(core) for core in FLM_LIVE_BACKGROUND_AFFINITY_CORES)
+    command = ["taskset", "-c", core_list, *command]
+  return command
+
+
+def _current_process_affinity() -> list[int]:
+  try:
+    return sorted(os.sched_getaffinity(0))
+  except (AttributeError, OSError):
+    return []
 
 
 def read_flm_status() -> dict[str, Any]:
@@ -1083,7 +1111,7 @@ def start_live_flm_tuning() -> dict[str, Any]:
       "startedAt": float(previous_status.get("startedAt", time.time()) or time.time()) if resuming_session else time.time(),
       "running": True,
       "state": "starting",
-      "message": "Starting the on-device Live FLM worker.",
+      "message": "Loading Live FLM at low priority on background cores.",
       "adjustmentCount": int(previous_status.get("adjustmentCount", 0) or 0) if resuming_session else 0,
       "sampleCount": 0,
       "eligibleSampleCount": 0,
@@ -1092,21 +1120,14 @@ def start_live_flm_tuning() -> dict[str, Any]:
       "startingTuneLabel": str(baseline.get("startingTuneLabel", "Current manual values") or "Current manual values"),
       "healthArmed": False,
       "healthFaults": [],
+      "targetAffinityCores": list(FLM_LIVE_BACKGROUND_AFFINITY_CORES) if not PC else [],
       "lastEvaluationDurationMs": 0.0,
       "canResume": False,
       "canRevert": True,
     }
     _write_live_flm_status(initial_status)
     repo_root = Path(__file__).resolve().parents[3]
-    command = [
-      "nice",
-      "-n",
-      "19",
-      sys.executable or "python3",
-      str(Path(__file__).resolve()),
-      "live-worker",
-      str(baseline["sessionId"]),
-    ]
+    command = _live_worker_command(str(baseline["sessionId"]))
     log_file = None
     try:
       log_file = open(FLM_LIVE_LOG_PATH, "ab")
@@ -1121,8 +1142,6 @@ def start_live_flm_tuning() -> dict[str, Any]:
       status = {
         **initial_status,
         "pid": FLM_LIVE_PROCESS.pid,
-        "state": "waiting_onroad" if not params.get_bool("IsOnroad") else "observing",
-        "message": "Waiting for an onroad torque-control sample." if not params.get_bool("IsOnroad") else "Collecting a fresh evidence window.",
       }
       _write_live_flm_status(status)
       return read_live_flm_status()
@@ -5322,6 +5341,8 @@ def run_worker(payload_json: str) -> None:
 
 
 def run_live_worker(session_id: str) -> None:
+  affinity_cores = _current_process_affinity()
+
   # Keep messaging out of the module import path so FLM report tooling and its
   # unit tests do not need a live msgq runtime.
   from cereal import messaging
@@ -5446,6 +5467,7 @@ def run_live_worker(session_id: str) -> None:
             "healthArmed": health_armed,
             "healthFailureKind": health_failure_kind,
             "healthFaults": health_faults,
+            "affinityCores": affinity_cores,
             "lastEvaluationDurationMs": last_evaluation_duration_ms,
             "maxEvaluationDurationMs": max_evaluation_duration_ms,
             "lastChangedKeys": last_changed_keys,
@@ -5621,6 +5643,7 @@ def run_live_worker(session_id: str) -> None:
           "pendingAdjustment": pending_plan is not None,
           "healthArmed": health_armed,
           "healthFaults": health_faults,
+          "affinityCores": affinity_cores,
           "lastEvaluationDurationMs": round(last_evaluation_duration_ms, 1),
           "maxEvaluationDurationMs": round(max_evaluation_duration_ms, 1),
           "evaluationCooldownSeconds": round(max(evaluation_cooldown_until - monotonic_now, 0.0), 1),

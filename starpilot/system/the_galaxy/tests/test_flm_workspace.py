@@ -246,19 +246,50 @@ def test_live_sample_window_trim_is_in_place_and_bounded(monkeypatch, tmp_path):
   assert [sample.t for sample in samples] == [1.0, 1.5, 2.0]
 
 
-def test_live_sample_gate_limits_message_processing_to_twenty_hz(tmp_path):
+def test_live_sample_gate_limits_message_processing_to_ten_hz(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
 
-  assert module.FLM_LIVE_SAMPLE_RATE_HZ == pytest.approx(20.0)
+  assert module.FLM_LIVE_SAMPLE_RATE_HZ == pytest.approx(10.0)
+  assert module.FLM_LIVE_MIN_ELIGIBLE_SAMPLES == 250
   assert module._live_sample_due(10.0, None) is True
-  assert module._live_sample_due(10.049, 10.0) is False
-  assert module._live_sample_due(10.051, 10.0) is True
-  assert module._live_loop_sleep_seconds(10.0, 10.01) == pytest.approx(0.04)
-  assert module._live_loop_sleep_seconds(10.0, 10.051) == 0.0
-  assert module.FLM_LIVE_MAX_BUFFER_SAMPLES < 2000
+  assert module._live_sample_due(10.099, 10.0) is False
+  assert module._live_sample_due(10.101, 10.0) is True
+  assert module._live_loop_sleep_seconds(10.0, 10.01) == pytest.approx(0.09)
+  assert module._live_loop_sleep_seconds(10.0, 10.101) == 0.0
+  assert module.FLM_LIVE_MAX_BUFFER_SAMPLES < 1000
 
 
-def test_live_service_health_uses_twenty_hz_aware_core_checks(tmp_path):
+def test_live_worker_environment_forces_single_threaded_math(monkeypatch, tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
+
+  env = module._worker_env(tmp_path)
+
+  for variable in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    assert env[variable] == "1"
+  assert env["OMP_WAIT_POLICY"] == "PASSIVE"
+  assert env["MALLOC_ARENA_MAX"] == "1"
+
+
+def test_live_worker_command_isolates_cold_start_on_background_cores(monkeypatch, tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  monkeypatch.setattr(module, "PC", False)
+
+  command = module._live_worker_command("session-1")
+
+  assert command[:3] == ["taskset", "-c", "1,2"]
+  assert command[3:6] == ["nice", "-n", "19"]
+  assert command[-2:] == ["live-worker", "session-1"]
+
+
+def test_live_worker_reports_actual_process_affinity(monkeypatch, tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  monkeypatch.setattr(module.os, "sched_getaffinity", lambda _pid: {1, 2}, raising=False)
+
+  assert module._current_process_affinity() == [1, 2]
+
+
+def test_live_service_health_uses_low_rate_aware_core_checks(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
   healthy = dict.fromkeys(module.FLM_LIVE_REQUIRED_SERVICES, True)
   recent = dict.fromkeys(module.FLM_LIVE_REQUIRED_SERVICES, 9.9)
