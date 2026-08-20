@@ -258,19 +258,56 @@ def test_live_sample_gate_limits_message_processing_to_twenty_hz(tmp_path):
   assert module.FLM_LIVE_MAX_BUFFER_SAMPLES < 2000
 
 
-def test_live_service_health_identifies_required_invalid_publisher(tmp_path):
+def test_live_service_health_uses_twenty_hz_aware_core_checks(tmp_path):
   module, _ = _load_flm_workspace_module(tmp_path)
-  healthy = {service: True for service in module.FLM_LIVE_REQUIRED_SERVICES}
-  sm = SimpleNamespace(seen=dict(healthy), valid=dict(healthy), alive=dict(healthy), freq_ok=dict(healthy))
+  healthy = dict.fromkeys(module.FLM_LIVE_REQUIRED_SERVICES, True)
+  recent = dict.fromkeys(module.FLM_LIVE_REQUIRED_SERVICES, 9.9)
+  sm = SimpleNamespace(
+    seen=dict(healthy),
+    valid=dict(healthy),
+    recv_time=recent,
+    alive=dict.fromkeys(module.FLM_LIVE_REQUIRED_SERVICES, False),
+    freq_ok=dict.fromkeys(module.FLM_LIVE_REQUIRED_SERVICES, False),
+  )
 
-  ready, faults = module._live_service_health(sm)
+  ready, faults = module._live_service_health(sm, 10.0)
   assert ready is True
   assert faults == []
 
-  sm.valid["liveTorqueParameters"] = False
-  ready, faults = module._live_service_health(sm)
+  sm.valid["carState"] = False
+  ready, faults = module._live_service_health(sm, 10.0)
   assert ready is False
-  assert faults == ["liveTorqueParameters:invalid"]
+  assert faults == ["carState:invalid"]
+
+  sm.valid["carState"] = True
+  sm.recv_time["carState"] = 9.49
+  ready, faults = module._live_service_health(sm, 10.0)
+  assert ready is False
+  assert faults == ["carState:stale"]
+
+
+def test_live_torque_health_waits_for_valid_data_then_detects_runtime_faults(tmp_path):
+  module, _ = _load_flm_workspace_module(tmp_path)
+  service = module.FLM_LIVE_TORQUE_SERVICE
+  sm = SimpleNamespace(
+    seen={service: True},
+    valid={service: False},
+    recv_time={service: 9.9},
+  )
+
+  ready, faults = module._live_torque_health(sm, 10.0)
+  assert ready is False
+  assert faults == [f"{service}:invalid"]
+
+  sm.valid[service] = True
+  ready, faults = module._live_torque_health(sm, 10.0)
+  assert ready is True
+  assert faults == []
+
+  sm.recv_time[service] = 8.99
+  ready, faults = module._live_torque_health(sm, 10.0)
+  assert ready is False
+  assert faults == [f"{service}:stale"]
 
 
 def test_live_health_guard_times_out_before_arming(tmp_path):
@@ -280,6 +317,57 @@ def test_live_health_guard_times_out_before_arming(tmp_path):
   assert module._live_health_failure_kind(False, 10.0, 0.0, 15.0) == "startup"
   assert module._live_health_failure_kind(True, 10.0, 20.0, 21.24) == ""
   assert module._live_health_failure_kind(True, 10.0, 20.0, 21.25) == "runtime"
+
+
+def test_live_worker_continues_while_torque_health_monitor_warms_up(monkeypatch, tmp_path):
+  module, fake_params_cls = _load_flm_workspace_module(tmp_path)
+  module.FLM_LIVE_STATUS_PATH = tmp_path / "live_status.json"
+  session_id = "live-torque-warmup"
+  module._write_json(module._live_baseline_path(), {
+    "sessionId": session_id,
+    "startingTuneLabel": "Test tune",
+  })
+  fake_params_cls._store = {"IsOnroad": True}
+
+  clock = SimpleNamespace(now=100.0)
+
+  class FakeSubMaster:
+    def __init__(self, services, **_kwargs):
+      self.seen = dict.fromkeys(services, True)
+      self.valid = dict.fromkeys(services, True)
+      self.valid[module.FLM_LIVE_TORQUE_SERVICE] = False
+      self.alive = dict.fromkeys(services, False)
+      self.freq_ok = dict.fromkeys(services, False)
+      self.recv_time = dict.fromkeys(services, clock.now)
+      self.updated = dict.fromkeys(services, False)
+
+    def update(self, _timeout):
+      if clock.now >= 106.0:
+        raise SystemExit(0)
+      for service in module.FLM_LIVE_REQUIRED_SERVICES:
+        self.recv_time[service] = clock.now
+
+  monkeypatch.setattr(
+    sys.modules["cereal"],
+    "messaging",
+    SimpleNamespace(SubMaster=FakeSubMaster),
+    raising=False,
+  )
+  restored = []
+  monkeypatch.setattr(module, "_restore_live_flm_baseline", lambda *_args, **kwargs: restored.append(kwargs["reason"]))
+  monkeypatch.setattr(module.time, "monotonic", lambda: clock.now)
+  monkeypatch.setattr(module.time, "sleep", lambda seconds: setattr(clock, "now", clock.now + seconds))
+
+  with pytest.raises(SystemExit):
+    module.run_live_worker(session_id)
+
+  status = module.read_live_flm_status()
+  assert restored == []
+  assert status["running"] is True
+  assert status["state"] == "observing"
+  assert status["coreHealthArmed"] is True
+  assert status["torqueHealthArmed"] is False
+  assert status["healthArmed"] is True
 
 
 def test_live_worker_uses_low_rate_subscriber_and_reverts_unhealthy_startup(monkeypatch, tmp_path):

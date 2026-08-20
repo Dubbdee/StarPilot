@@ -67,6 +67,8 @@ FLM_LIVE_MAX_BUFFER_SAMPLES = int(math.ceil(FLM_LIVE_MAX_WINDOW_SECONDS * FLM_LI
 FLM_LIVE_HEALTH_ARM_SECONDS = 2.0
 FLM_LIVE_HEALTH_STARTUP_TIMEOUT_SECONDS = 5.0
 FLM_LIVE_HEALTH_FAILURE_SECONDS = 1.25
+FLM_LIVE_CORE_STALE_SECONDS = 0.5
+FLM_LIVE_TORQUE_STALE_SECONDS = 1.0
 FLM_LIVE_SLOW_EVALUATION_SECONDS = 1.5
 FLM_LIVE_SLOW_EVALUATION_COOLDOWN_SECONDS = 30.0
 FLM_LIVE_REQUIRED_SERVICES = (
@@ -74,9 +76,8 @@ FLM_LIVE_REQUIRED_SERVICES = (
   "carState",
   "carControl",
   "carOutput",
-  "liveParameters",
-  "liveTorqueParameters",
 )
+FLM_LIVE_TORQUE_SERVICE = "liveTorqueParameters"
 FLM_UPLOAD_ROUTE_PREFIX = "upload:"
 FLM_UPLOAD_MAX_FILES = 64
 FLM_UPLOAD_MAX_FILE_BYTES = 512 * 1024 * 1024
@@ -3052,11 +3053,11 @@ def _live_loop_sleep_seconds(iteration_started: float, monotonic_now: float) -> 
   return max(FLM_LIVE_SAMPLE_INTERVAL_SECONDS - (monotonic_now - iteration_started), 0.0)
 
 
-def _live_service_health(sm) -> tuple[bool, list[str]]:
+def _live_service_health(sm, monotonic_now: float | None = None) -> tuple[bool, list[str]]:
   seen = getattr(sm, "seen", {})
   valid = getattr(sm, "valid", {})
-  alive = getattr(sm, "alive", {})
-  freq_ok = getattr(sm, "freq_ok", {})
+  recv_time = getattr(sm, "recv_time", {})
+  monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
   faults = []
 
   for service in FLM_LIVE_REQUIRED_SERVICES:
@@ -3065,10 +3066,29 @@ def _live_service_health(sm) -> tuple[bool, list[str]]:
       continue
     if not bool(valid.get(service, True)):
       faults.append(f"{service}:invalid")
-    if not bool(alive.get(service, True)):
-      faults.append(f"{service}:not_alive")
-    if not bool(freq_ok.get(service, True)):
-      faults.append(f"{service}:frequency")
+    last_received = float(recv_time.get(service, 0.0) or 0.0)
+    if last_received > 0.0 and monotonic_now - last_received > FLM_LIVE_CORE_STALE_SECONDS:
+      faults.append(f"{service}:stale")
+
+  return not faults, faults
+
+
+def _live_torque_health(sm, monotonic_now: float | None = None) -> tuple[bool, list[str]]:
+  seen = getattr(sm, "seen", {})
+  valid = getattr(sm, "valid", {})
+  recv_time = getattr(sm, "recv_time", {})
+  monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
+  service = FLM_LIVE_TORQUE_SERVICE
+  faults = []
+
+  if not bool(seen.get(service, False)):
+    faults.append(f"{service}:not_seen")
+  else:
+    if not bool(valid.get(service, True)):
+      faults.append(f"{service}:invalid")
+    last_received = float(recv_time.get(service, 0.0) or 0.0)
+    if last_received > 0.0 and monotonic_now - last_received > FLM_LIVE_TORQUE_STALE_SECONDS:
+      faults.append(f"{service}:stale")
 
   return not faults, faults
 
@@ -5354,6 +5374,9 @@ def run_live_worker(session_id: str) -> None:
   health_wait_started = time.monotonic() if onroad else None
   health_good_since = 0.0
   health_fault_since = 0.0
+  torque_health_armed = False
+  torque_health_good_since = 0.0
+  torque_health_fault_since = 0.0
   health_faults: list[str] = []
   state = "observing" if onroad else "waiting_onroad"
   message = "Collecting a fresh evidence window." if onroad else "Waiting for the vehicle to go onroad."
@@ -5398,6 +5421,9 @@ def run_live_worker(session_id: str) -> None:
         health_wait_started = None
         health_good_since = 0.0
         health_fault_since = 0.0
+        torque_health_armed = False
+        torque_health_good_since = 0.0
+        torque_health_fault_since = 0.0
         health_faults = []
         latest_stats = {}
         state = "waiting_onroad"
@@ -5405,7 +5431,10 @@ def run_live_worker(session_id: str) -> None:
       else:
         if health_wait_started is None:
           health_wait_started = monotonic_now
-        services_healthy, health_faults = _live_service_health(sm)
+        services_healthy, service_faults = _live_service_health(sm, monotonic_now)
+        torque_healthy, torque_faults = _live_torque_health(sm, monotonic_now)
+        health_faults = [*service_faults, *torque_faults]
+
         if services_healthy:
           health_fault_since = 0.0
           if health_good_since <= 0.0:
@@ -5417,14 +5446,36 @@ def run_live_worker(session_id: str) -> None:
           if health_armed and health_fault_since <= 0.0:
             health_fault_since = monotonic_now
 
+        if torque_healthy:
+          torque_health_fault_since = 0.0
+          if torque_health_good_since <= 0.0:
+            torque_health_good_since = monotonic_now
+          if not torque_health_armed and monotonic_now - torque_health_good_since >= FLM_LIVE_HEALTH_ARM_SECONDS:
+            torque_health_armed = True
+        else:
+          torque_health_good_since = 0.0
+          if torque_health_armed and torque_health_fault_since <= 0.0:
+            torque_health_fault_since = monotonic_now
+
         health_failure_kind = _live_health_failure_kind(
           health_armed,
           health_wait_started,
           health_fault_since,
           monotonic_now,
         )
+        guard_faults = service_faults
+        if not health_failure_kind and torque_health_armed:
+          health_failure_kind = _live_health_failure_kind(
+            True,
+            None,
+            torque_health_fault_since,
+            monotonic_now,
+          )
+          if health_failure_kind:
+            guard_faults = torque_faults
+
         if health_failure_kind:
-          fault_summary = ", ".join(health_faults) or "required onroad messages"
+          fault_summary = ", ".join(guard_faults) or "required onroad messages"
           if health_failure_kind == "startup":
             failure_message = f"required onroad processes did not remain healthy for {FLM_LIVE_HEALTH_ARM_SECONDS:.0f} continuous seconds "
             failure_message += f"within {FLM_LIVE_HEALTH_STARTUP_TIMEOUT_SECONDS:.0f} seconds ({fault_summary})"
@@ -5444,8 +5495,10 @@ def run_live_worker(session_id: str) -> None:
             "windowSeconds": 0.0,
             "changeLog": list(change_log),
             "healthArmed": health_armed,
+            "coreHealthArmed": health_armed,
+            "torqueHealthArmed": torque_health_armed,
             "healthFailureKind": health_failure_kind,
-            "healthFaults": health_faults,
+            "healthFaults": guard_faults,
             "lastEvaluationDurationMs": last_evaluation_duration_ms,
             "maxEvaluationDurationMs": max_evaluation_duration_ms,
             "lastChangedKeys": last_changed_keys,
@@ -5457,6 +5510,10 @@ def run_live_worker(session_id: str) -> None:
           })
           return
 
+        if health_armed and services_healthy and not torque_health_armed and not torque_healthy:
+          state = "observing"
+          message = "Collecting Live FLM evidence while the lateral safety monitor initializes."
+
         if not health_armed or not services_healthy:
           samples.clear()
           pending_plan = None
@@ -5464,10 +5521,17 @@ def run_live_worker(session_id: str) -> None:
           last_sample_at = None
           if services_healthy:
             state = "arming_health_guard"
-            message = "Verifying stable onroad processes before collecting Live FLM evidence."
+            message = "Verifying stable core onroad processes before collecting Live FLM evidence."
           else:
             state = "waiting_for_healthy_processes"
-            message = "Waiting for required onroad processes before collecting Live FLM evidence."
+            message = "Waiting for required core onroad processes before collecting Live FLM evidence."
+        elif torque_health_armed and not torque_healthy:
+          samples.clear()
+          pending_plan = None
+          collect_after = 0.0
+          last_sample_at = None
+          state = "waiting_for_lateral_health"
+          message = "Pausing Live FLM evidence because lateral-control validation became unhealthy."
         elif (
           bool(getattr(sm, "updated", {}).get("controlsState", False))
           and _live_sample_due(monotonic_now, last_sample_at)
@@ -5620,6 +5684,8 @@ def run_live_worker(session_id: str) -> None:
           "startingTuneLabel": starting_tune_label,
           "pendingAdjustment": pending_plan is not None,
           "healthArmed": health_armed,
+          "coreHealthArmed": health_armed,
+          "torqueHealthArmed": torque_health_armed,
           "healthFaults": health_faults,
           "lastEvaluationDurationMs": round(last_evaluation_duration_ms, 1),
           "maxEvaluationDurationMs": round(max_evaluation_duration_ms, 1),
