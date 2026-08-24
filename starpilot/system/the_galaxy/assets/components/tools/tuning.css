@@ -31,56 +31,6 @@
   margin-top: var(--margin-base);
 }
 
-.flmLiveActions {
-  display: flex;
-  flex: 0 1 auto;
-  flex-wrap: wrap;
-  gap: var(--gap-xs);
-  justify-content: flex-end;
-}
-
-.flmLiveStatusGrid {
-  margin-top: var(--margin-base);
-}
-
-.flmLiveChangeLog {
-  background: rgba(0, 0, 0, 0.14);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: var(--border-radius-sm);
-  padding: var(--padding-sm);
-}
-
-.flmLiveChangeLog h4 {
-  margin: 0 0 var(--margin-sm);
-}
-
-.flmLiveChangeLines {
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-  max-height: 13rem;
-  overflow: auto;
-}
-
-.flmLiveChangeLine {
-  align-items: baseline;
-  display: grid;
-  font-size: var(--font-size-xs);
-  gap: var(--gap-xs);
-  grid-template-columns: auto auto minmax(0, 1fr);
-}
-
-.flmLiveChangeLine time,
-.flmLiveChangeLine span {
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.flmLiveChangeLine code {
-  color: var(--text-color);
-  overflow-wrap: anywhere;
-}
-
 .flmRouteList,
 .flmWorkspaceList,
 .flmFindings {
@@ -645,22 +595,5 @@
 
   .flmUploadControls {
     grid-template-columns: 1fr;
-  }
-
-  .flmLiveCard .flmCardHeader {
-    flex-direction: column;
-  }
-
-  .flmLiveActions {
-    justify-content: flex-start;
-    width: 100%;
-  }
-
-  .flmLiveChangeLine {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  .flmLiveChangeLine code {
-    grid-column: 1 / -1;
   }
 }

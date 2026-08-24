@@ -6577,12 +6577,10 @@ def setup(app):
     is_onroad = params.get_bool("IsOnroad")
     if is_onroad:
       flm_workspace.cancel_flm_if_onroad()
-    flm_workspace.live_flm_running()
     workspace = flm_workspace.list_workspace()
     return jsonify({
       "isOnroad": is_onroad,
       "status": flm_workspace.read_flm_status(),
-      "liveStatus": flm_workspace.read_live_flm_status(),
       "activeTrial": workspace.get("activeTrial"),
       "reports": workspace.get("reports", [])[:10],
       "savedTunes": workspace.get("savedTunes", []),
@@ -6593,8 +6591,6 @@ def setup(app):
   def start_flm_analysis():
     if params.get_bool("IsOnroad"):
       return jsonify({"error": "FLM analysis can only run offroad."}), 409
-    if flm_workspace.live_flm_running():
-      return jsonify({"error": "Stop Live FLM before starting a route analysis."}), 409
 
     data = request.get_json(silent=True) or {}
     route_names = [str(route).strip() for route in data.get("routes", []) if str(route).strip()]
@@ -6624,54 +6620,6 @@ def setup(app):
       "stopped": bool(stopped),
       "status": flm_workspace.read_flm_status(),
     }), 200
-
-  @app.route("/api/flm/live/status", methods=["GET"])
-  def get_live_flm_status():
-    flm_workspace.live_flm_running()
-    return jsonify({"liveStatus": flm_workspace.read_live_flm_status()}), 200
-
-  @app.route("/api/flm/live/start", methods=["POST"])
-  def start_live_flm():
-    try:
-      status = flm_workspace.start_live_flm_tuning()
-    except RuntimeError as error:
-      return jsonify({"error": str(error)}), 409
-    except Exception as error:
-      return jsonify({"error": f"{type(error).__name__}: {error}"}), 500
-    return jsonify({
-      "message": "Live FLM started. It will adapt only from fresh, confirmed torque-control evidence.",
-      "liveStatus": status,
-    }), 200
-
-  @app.route("/api/flm/live/stop", methods=["POST"])
-  def stop_live_flm():
-    stopped = flm_workspace.stop_live_flm_tuning()
-    return jsonify({
-      "message": "Stopped Live FLM. Its current tune remains active." if stopped else "Live FLM was already stopped.",
-      "stopped": bool(stopped),
-      "liveStatus": flm_workspace.read_live_flm_status(),
-    }), 200
-
-  @app.route("/api/flm/live/save", methods=["POST"])
-  def save_live_flm():
-    data = request.get_json(silent=True) or {}
-    try:
-      return jsonify(flm_workspace.save_live_flm_tune(str(data.get("name") or ""))), 200
-    except ValueError as error:
-      return jsonify({"error": str(error)}), 400
-    except RuntimeError as error:
-      return jsonify({"error": str(error)}), 409
-    except Exception as error:
-      return jsonify({"error": f"{type(error).__name__}: {error}"}), 500
-
-  @app.route("/api/flm/live/revert", methods=["POST"])
-  def revert_live_flm():
-    try:
-      return jsonify(flm_workspace.revert_live_flm_tuning()), 200
-    except FileNotFoundError:
-      return jsonify({"error": "No Live FLM rollback baseline was found."}), 404
-    except Exception as error:
-      return jsonify({"error": f"{type(error).__name__}: {error}"}), 500
 
   @app.route("/api/flm/uploads", methods=["POST"])
   def upload_flm_rlogs():
@@ -6857,8 +6805,6 @@ def setup(app):
       result = flm_workspace.accept_trial_as_baseline()
     except FileNotFoundError:
       return jsonify({"error": "No active FLM trial was found."}), 404
-    except RuntimeError as error:
-      return jsonify({"error": str(error)}), 409
 
     return jsonify(result), 200
 

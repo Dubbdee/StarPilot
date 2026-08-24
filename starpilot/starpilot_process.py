@@ -26,13 +26,6 @@ from openpilot.starpilot.common.safe_mode import (
   restore_safe_mode,
   safe_mode_enabled,
 )
-from openpilot.starpilot.common.live_flm_runtime import (
-  apply_live_flm_runtime_update,
-  clear_live_flm_runtime_update,
-  live_flm_runtime_marker,
-  live_flm_runtime_update_path,
-  read_live_flm_runtime_update,
-)
 from openpilot.starpilot.common.starpilot_utilities import ThreadManager, flash_panda, is_url_pingable, lock_doors, use_konik_server
 from openpilot.starpilot.common.starpilot_variables import ERROR_LOGS_PATH, StarPilotVariables
 from openpilot.starpilot.controls.starpilot_planner import StarPilotPlanner, serialize_starpilot_toggles
@@ -44,7 +37,6 @@ DASHBOARD_ANALYSIS_REFRESH_RATE = 60
 DRIVE_STATS_SYNC_RATE = 30
 OFFROAD_GPS_MEMORY_REFRESH_SECONDS = 1.0
 OFFROAD_GPS_PERSIST_REFRESH_SECONDS = 30.0
-FLM_LIVE_RUNTIME_POLL_INTERVAL_SECONDS = 0.25
 TOGGLE_BROADCAST_INTERVAL_FRAMES = int(1 / DT_MDL)
 UPDATE_CHECK_INTERVAL_SECONDS = 60 * 60
 
@@ -280,10 +272,6 @@ def starpilot_thread():
   serialized_starpilot_toggles = serialize_starpilot_toggles(starpilot_toggles)
   toggle_broadcast_pending = True
   toggle_update_result = {}
-  live_flm_runtime_path = live_flm_runtime_update_path(Paths.shm_path())
-  clear_live_flm_runtime_update(live_flm_runtime_path)
-  last_live_flm_runtime_marker = ""
-  next_live_flm_runtime_poll = 0.0
 
   drive_stats_session = requests.Session()
   next_dashboard_analysis_refresh = 0.0
@@ -329,17 +317,6 @@ def starpilot_thread():
       starpilot_tracking = StarPilotTracking(starpilot_planner, starpilot_toggles)
 
       transition_onroad(error_log)
-
-    if monotonic_now >= next_live_flm_runtime_poll:
-      live_flm_runtime_update = read_live_flm_runtime_update(live_flm_runtime_path)
-      current_live_flm_runtime_marker = live_flm_runtime_marker(live_flm_runtime_update)
-      if current_live_flm_runtime_marker != last_live_flm_runtime_marker:
-        starpilot_toggles, live_flm_applied = apply_live_flm_runtime_update(starpilot_toggles, live_flm_runtime_update)
-        if live_flm_applied:
-          serialized_starpilot_toggles = serialize_starpilot_toggles(starpilot_toggles)
-          toggle_broadcast_pending = True
-        last_live_flm_runtime_marker = current_live_flm_runtime_marker
-      next_live_flm_runtime_poll = monotonic_now + FLM_LIVE_RUNTIME_POLL_INTERVAL_SECONDS
 
     if started and sm.updated["modelV2"]:
       broadcast_toggles = toggle_broadcast_pending or (rate_keeper.frame % TOGGLE_BROADCAST_INTERVAL_FRAMES == 0)
@@ -406,10 +383,6 @@ def starpilot_thread():
       starpilot_variables, starpilot_toggles = completed_toggle_update
       serialized_starpilot_toggles = serialize_starpilot_toggles(starpilot_toggles)
       toggle_broadcast_pending = True
-      # The persisted reload should contain the same values, but re-check the
-      # compact overlay next frame in case another settings refresh overlapped
-      # a Live FLM adjustment.
-      last_live_flm_runtime_marker = ""
 
       model_randomizer_enabled = params.get_bool("ModelRandomizer")
       if model_randomizer_enabled and not model_randomizer_previously and not started:

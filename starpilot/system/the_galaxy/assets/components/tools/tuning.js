@@ -3,7 +3,6 @@ import { html, reactive } from "/assets/vendor/arrow-core.js"
 const MAX_RENDERED_ROUTES = 250
 const ROUTE_FLUSH_INTERVAL_MS = 120
 const STATUS_POLL_MS = 3000
-const LIVE_STATUS_POLL_MS = 1000
 
 const state = reactive({
   loadingRoutes: true,
@@ -17,9 +16,8 @@ const state = reactive({
   routeProgress: 0,
   routeTotal: 0,
   connectDongleId: "",
-  workspace: { reports: [], savedTunes: [], uploads: [], activeTrial: null, status: {}, liveStatus: {} },
+  workspace: { reports: [], savedTunes: [], uploads: [], activeTrial: null, status: {} },
   status: {},
-  liveStatus: {},
   report: null,
   customTrialSchema: null,
   customTrialPreset: "",
@@ -43,7 +41,6 @@ let flushTimerId = null
 let seenRouteNames = new Set()
 let initialized = false
 let statusPollHandle = null
-let lastFullStatusPoll = 0
 let selectedUploadFiles = []
 
 function isTuningRouteActive() {
@@ -108,43 +105,6 @@ function formatStatusAge(updatedAt) {
   if (ageSec < 60) return `${ageSec}s ago`
   if (ageSec < 3600) return `${Math.round(ageSec / 60)}m ago`
   return `${Math.round(ageSec / 3600)}h ago`
-}
-
-function formatLiveChangeValue(value) {
-  if (Array.isArray(value)) return `[${value.map(formatLiveChangeValue).join(", ")}]`
-  if (typeof value === "number") return Number(value.toFixed(4)).toString()
-  if (typeof value === "boolean") return value ? "true" : "false"
-  if (value == null || value === "") return "unset"
-  return String(value)
-}
-
-function formatLiveChangeKey(key) {
-  const text = String(key || "value")
-  if (text.startsWith("base_friction_threshold.")) return text
-  return text.split(".").pop() || text
-}
-
-function formatLiveChangeTime(timestamp) {
-  const date = new Date(safeCount(timestamp) * 1000)
-  return Number.isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString()
-}
-
-function renderLiveChangeLog() {
-  const changes = Array.isArray(state.liveStatus?.changeLog) ? [...state.liveStatus.changeLog].reverse() : []
-  if (!changes.length) {
-    return html`<p class="longManeuverMuted">Applied value changes will appear here.</p>`
-  }
-  return html`
-    <div class="flmLiveChangeLines">
-      ${changes.map(change => html`
-        <div class="flmLiveChangeLine">
-          <time>${formatLiveChangeTime(change.at)}</time>
-          <span>${change.stepLabel || "FLM"}</span>
-          <code>${formatLiveChangeKey(change.key)}: ${formatLiveChangeValue(change.from)} → ${formatLiveChangeValue(change.to)}</code>
-        </div>
-      `)}
-    </div>
-  `
 }
 
 function resetRouteStreamState() {
@@ -278,7 +238,6 @@ async function fetchWorkspace() {
     if (!response.ok) throw new Error(payload.error || "Failed to load tuning workspace.")
     state.workspace = payload
     state.status = payload.status || {}
-    state.liveStatus = payload.liveStatus || {}
   } catch (error) {
     state.error = error?.message || "Failed to load tuning workspace."
   } finally {
@@ -380,7 +339,6 @@ async function fetchStatus() {
       ...(payload.status || {}),
       isOnroad: !!payload.isOnroad,
     }
-    state.liveStatus = payload.liveStatus || {}
     if (payload.activeTrial !== undefined) {
       state.workspace = {
         ...state.workspace,
@@ -393,20 +351,8 @@ async function fetchStatus() {
     if (reportId && state.report?.reportId !== reportId) {
       await loadReport(reportId)
     }
-    lastFullStatusPoll = Date.now()
   } catch (error) {
     state.error = error?.message || "Failed to load tuning status."
-  }
-}
-
-async function fetchLiveStatus() {
-  try {
-    const response = await fetch("/api/flm/live/status", { cache: "no-store" })
-    const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || "Failed to load Live FLM status.")
-    state.liveStatus = payload.liveStatus || {}
-  } catch (error) {
-    state.error = error?.message || "Failed to load Live FLM status."
   }
 }
 
@@ -426,13 +372,9 @@ function ensurePolling() {
       return
     }
     if (document.visibilityState === "visible") {
-      if (state.liveStatus?.running && Date.now() - lastFullStatusPoll < STATUS_POLL_MS) {
-        await fetchLiveStatus()
-      } else {
-        await fetchStatus()
-      }
+      await fetchStatus()
     }
-    statusPollHandle = setTimeout(poll, state.liveStatus?.running ? LIVE_STATUS_POLL_MS : STATUS_POLL_MS)
+    statusPollHandle = setTimeout(poll, STATUS_POLL_MS)
   }
 
   statusPollHandle = setTimeout(poll, STATUS_POLL_MS)
@@ -623,91 +565,6 @@ async function applyProfile(profileId) {
   }
 }
 
-async function startLiveFlm() {
-  if (state.runningAction || state.liveStatus?.running) return
-  state.runningAction = true
-  try {
-    const response = await fetch("/api/flm/live/start", { method: "POST" })
-    const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || "Failed to start Live FLM.")
-    state.liveStatus = payload.liveStatus || {}
-    state.error = ""
-    await fetchWorkspace()
-    showSnackbar(payload.message || "Live FLM started.")
-  } catch (error) {
-    state.error = error?.message || "Failed to start Live FLM."
-    showSnackbar(state.error, "error")
-  } finally {
-    state.runningAction = false
-  }
-}
-
-async function stopLiveFlm() {
-  if (state.runningAction || !state.liveStatus?.running) return
-  state.runningAction = true
-  try {
-    const response = await fetch("/api/flm/live/stop", { method: "POST" })
-    const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || "Failed to stop Live FLM.")
-    state.liveStatus = payload.liveStatus || {}
-    state.error = ""
-    showSnackbar(payload.message || "Live FLM stopped.")
-  } catch (error) {
-    state.error = error?.message || "Failed to stop Live FLM."
-    showSnackbar(state.error, "error")
-  } finally {
-    state.runningAction = false
-  }
-}
-
-async function saveLiveFlmTune() {
-  if (state.runningAction || !state.liveStatus?.canRevert || !state.workspace?.activeTrial) return
-  const defaultName = state.workspace.activeTrial.profileLabel || "Live FLM Tune"
-  const name = window.prompt("Name this Live FLM tune", defaultName)
-  if (name === null) return
-
-  state.runningAction = true
-  try {
-    const response = await fetch("/api/flm/live/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    })
-    const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || "Failed to save the Live FLM tune.")
-    state.liveStatus = payload.liveStatus || {}
-    state.workspace = payload.workspace || state.workspace
-    state.error = ""
-    lastFullStatusPoll = Date.now()
-    showSnackbar(payload.message || "Live FLM stopped and its tune was saved.")
-  } catch (error) {
-    state.error = error?.message || "Failed to save the Live FLM tune."
-    showSnackbar(state.error, "error")
-  } finally {
-    state.runningAction = false
-  }
-}
-
-async function revertLiveFlm() {
-  if (state.runningAction || !state.liveStatus?.canRevert) return
-  state.runningAction = true
-  try {
-    const response = await fetch("/api/flm/live/revert", { method: "POST" })
-    const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || "Failed to revert Live FLM.")
-    state.liveStatus = payload.liveStatus || {}
-    state.workspace = payload.workspace || state.workspace
-    state.error = ""
-    await fetchStatus()
-    showSnackbar(payload.message || "Live FLM reverted.")
-  } catch (error) {
-    state.error = error?.message || "Failed to revert Live FLM."
-    showSnackbar(state.error, "error")
-  } finally {
-    state.runningAction = false
-  }
-}
-
 function setCustomGenericValue(key, value) {
   if (!state.customTrialValues) return
   state.customTrialPreset = "custom"
@@ -784,7 +641,7 @@ async function applyCustomTrial() {
 }
 
 async function saveCurrentTune() {
-  if (state.runningAction || state.liveStatus?.canRevert || !state.workspace?.activeTrial) return
+  if (state.runningAction || !state.workspace?.activeTrial) return
   const defaultName = state.workspace.activeTrial.profileLabel || state.workspace.currentCarFingerprint || "Saved Tune"
   const name = window.prompt("Name this tune", defaultName)
   if (name === null) return
@@ -1680,13 +1537,13 @@ export function Tuning() {
 
       <div class="longManeuverCard">
         <p class="longManeuverIntro">
-          Analyze saved routes or let Live FLM use the same deterministic reasoning on fresh driving evidence. Live FLM selects conservative, recommended, or assertive steps from the size and consistency of the mismatch.
+          Analyze one or more local routes, review deterministic lateral findings, apply a bounded trial, drive, then revert or refine.
         </p>
 
         <div class="longManeuverActions">
           <button
             class="longManeuverButton"
-            disabled="${() => state.runningAction || state.selectedRoutes.length === 0 || !!state.status?.isOnroad || !!state.liveStatus?.running}"
+            disabled="${() => state.runningAction || state.selectedRoutes.length === 0 || !!state.status?.isOnroad}"
             @click="${runAnalyze}">
             Analyze Selected Routes
           </button>
@@ -1698,13 +1555,13 @@ export function Tuning() {
           </button>
           <button
             class="longManeuverButton"
-            disabled="${() => state.runningAction || !!state.liveStatus?.canRevert || !state.workspace?.activeTrial || state.workspace.activeTrial.rollbackAvailable === false}"
+            disabled="${() => state.runningAction || !state.workspace?.activeTrial || state.workspace.activeTrial.rollbackAvailable === false}"
             @click="${revertProfile}">
             Revert Trial
           </button>
           <button
             class="longManeuverButton"
-            disabled="${() => state.runningAction || !!state.liveStatus?.canRevert || !state.workspace?.activeTrial}"
+            disabled="${() => state.runningAction || !state.workspace?.activeTrial}"
             @click="${saveCurrentTune}">
             Save Tune
           </button>
@@ -1767,70 +1624,6 @@ export function Tuning() {
         ${() => state.status?.lastSkippedSegment ? html`
           <p class="longManeuverMuted">Skipped ${state.status.lastSkippedSegment} after it exceeded the read limit.</p>
         ` : ""}
-
-        <section class="flmCard flmLiveCard">
-          <div class="flmCardHeader">
-            <div>
-              <h3>Live FLM</h3>
-              <p class="longManeuverMuted">
-                Tunes the active torque controller while driving. Every adjustment uses a fresh evidence window, chooses the existing FLM step size from issue severity, and applies immediately when the evidence is confirmed.
-              </p>
-            </div>
-            <div class="flmLiveActions">
-              <button
-                class="longManeuverButton"
-                disabled="${() => state.runningAction || !!state.liveStatus?.running || !!state.status?.running}"
-                @click="${startLiveFlm}">
-                ${() => state.liveStatus?.canResume ? "Resume Live FLM" : "Start Live FLM"}
-              </button>
-              <button
-                class="longManeuverButton danger"
-                disabled="${() => state.runningAction || !state.liveStatus?.running}"
-                @click="${stopLiveFlm}">
-                Stop
-              </button>
-              <button
-                class="longManeuverButton"
-                disabled="${() => state.runningAction || !state.liveStatus?.canRevert || !state.workspace?.activeTrial}"
-                @click="${saveLiveFlmTune}">
-                ${() => state.liveStatus?.running ? "Stop & Save Tune" : "Save Live Tune"}
-              </button>
-              <button
-                class="longManeuverButton"
-                disabled="${() => state.runningAction || !state.liveStatus?.canRevert}"
-                @click="${revertLiveFlm}">
-                Revert Pre-Live Tune
-              </button>
-            </div>
-          </div>
-
-          <div class="longManeuverStatusGrid flmLiveStatusGrid">
-            <p><strong>State:</strong> ${() => state.liveStatus?.state || "idle"}</p>
-            <p><strong>Running:</strong> ${() => state.liveStatus?.running ? "Yes" : "No"}</p>
-            <p><strong>Started From:</strong> ${() => state.liveStatus?.startingTuneLabel || state.workspace?.activeTrial?.profileLabel || "Current manual values"}</p>
-            <p><strong>Evidence Window:</strong> ${() => `${safeCount(state.liveStatus?.windowSeconds).toFixed(1)}s`}</p>
-            <p><strong>Eligible Samples:</strong> ${() => safeCount(state.liveStatus?.eligibleSampleCount)}</p>
-            <p><strong>Adjustments:</strong> ${() => safeCount(state.liveStatus?.adjustmentCount)}</p>
-            <p><strong>Latest Step:</strong> ${() => state.liveStatus?.lastStepLabel ? `${state.liveStatus.lastStepLabel} (${safeCount(state.liveStatus.lastStepMultiplier).toFixed(2)}×)` : "Waiting"}</p>
-            <p><strong>Mean Tracking Error:</strong> ${() => state.liveStatus?.meanErrorAbs == null ? "Waiting" : safeCount(state.liveStatus.meanErrorAbs).toFixed(4)}</p>
-            <p><strong>Path:</strong> ${() => state.liveStatus?.lastPathLabel || "Waiting"}</p>
-          </div>
-          <p>${() => state.liveStatus?.message || "Start Live FLM whenever needed; it loads at low priority on background cores, then tunes from fresh onroad torque-control evidence."}</p>
-          <p class="longManeuverMuted">
-            The active values survive ignition cycles. Stop & Save Tune also stores the result in the regular Saved Tunes list and finishes this live session.
-          </p>
-          ${() => state.liveStatus?.lastStepReason ? html`
-            <p class="longManeuverMuted"><strong>Why this step:</strong> ${state.liveStatus.lastStepReason}</p>
-          ` : ""}
-          ${() => (state.liveStatus?.lastBuckets || []).length ? html`
-            <p class="longManeuverMuted"><strong>Latest issues:</strong> ${state.liveStatus.lastBuckets.join(", ")}</p>
-          ` : ""}
-          <div class="flmCardSubsection flmLiveChangeLog">
-            <h4>Applied Value Changes</h4>
-            ${() => renderLiveChangeLog()}
-          </div>
-          ${() => state.liveStatus?.error ? html`<p class="longManeuverError">${state.liveStatus.error}</p>` : ""}
-        </section>
 
         <div class="flmTwoColumn">
           <section class="flmCard">
@@ -1989,7 +1782,7 @@ export function Tuning() {
               </div>
               <button
                 class="longManeuverButton"
-                disabled="${() => state.runningAction || !!state.liveStatus?.canRevert || !state.workspace?.activeTrial}"
+                disabled="${() => state.runningAction || !state.workspace?.activeTrial}"
                 @click="${saveCurrentTune}">
                 Save Current
               </button>
