@@ -614,10 +614,10 @@ function setCustomKnobValue(key, value) {
 }
 
 async function applyCustomTrial() {
-  if (!state.report?.reportId || !state.customTrialValues || state.runningAction || state.status?.isOnroad) return
+  if (!state.report?.reportId || !state.customTrialValues || state.runningAction) return
   const knobCount = safeCount(state.customTrialSchema?.vehicleKnobCount)
   if (!window.confirm(
-    `Apply this exact custom FLM trial with ${knobCount} vehicle controls? Revert Trial will restore the settings from before the FLM trial. Apply while parked and evaluate changes cautiously.`
+    `Apply this exact custom FLM trial with ${knobCount} vehicle controls? Revert Trial will restore the settings from before the FLM trial. Values can take effect immediately, including while on-road.`
   )) return
 
   state.runningAction = true
@@ -1279,7 +1279,7 @@ function renderCustomTrialEditor() {
         </div>
         <button
           class="longManeuverButton"
-          disabled="${() => state.runningAction || state.status?.isOnroad || !state.customTrialValues || state.workspace?.activeTrial?.rollbackAvailable === false}"
+          disabled="${() => state.runningAction || !state.customTrialValues || state.workspace?.activeTrial?.rollbackAvailable === false}"
           @click="${applyCustomTrial}">
           Apply Custom Trial
         </button>
@@ -1299,7 +1299,7 @@ function renderCustomTrialEditor() {
       </div>
 
       <div class="flmTrackingNotice">
-        Custom trials force Advanced Lateral Tune on and automatic torque tuning off so the entered values remain active. Server-side limits still apply. Apply only while parked; stay ready to steer and use Revert Trial if behavior is not clearly better.
+        Custom trials force Advanced Lateral Tune on and automatic torque tuning off so the entered values remain active. Server-side limits still apply. Values can take effect immediately, including while on-road; stay ready to steer and use Revert Trial if behavior is not clearly better.
       </div>
 
       <div class="flmCustomSection">
@@ -1386,7 +1386,7 @@ function renderCustomTrialEditor() {
       <div class="longManeuverActions">
         <button
           class="longManeuverButton"
-          disabled="${() => state.runningAction || state.status?.isOnroad || state.workspace?.activeTrial?.rollbackAvailable === false}"
+          disabled="${() => state.runningAction || state.workspace?.activeTrial?.rollbackAvailable === false}"
           @click="${applyCustomTrial}">
           Apply Exact Custom Values
         </button>

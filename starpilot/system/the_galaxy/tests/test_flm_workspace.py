@@ -1245,7 +1245,7 @@ def test_custom_trial_validation_requires_all_knobs_and_enforces_bounds(tmp_path
     module.validate_custom_trial_values(report["reportId"], values)
 
 
-def test_apply_custom_trial_uses_exact_full_set_and_reverts_original_baseline(tmp_path):
+def test_apply_custom_trial_allows_onroad_exact_set_and_reverts_original_baseline(tmp_path):
   module, fake_params_cls = _load_flm_workspace_module(tmp_path)
   report, supported, first_symbol, _ = _write_custom_trial_report(module)
   schema = module.build_custom_trial_schema(report["reportId"])
@@ -1255,7 +1255,7 @@ def test_apply_custom_trial_uses_exact_full_set_and_reverts_original_baseline(tm
   values["flmOverrides"]["vehicleKnobs"][first_symbol] = custom_value
   baseline_overrides = {"vehicleKnobs": {"legacy.extra": 0.4}}
   fake_params_cls._store = {
-    "IsOnroad": False,
+    "IsOnroad": True,
     "AdvancedLateralTune": False,
     "ForceAutoTune": True,
     "ForceAutoTuneOff": False,
@@ -1281,6 +1281,7 @@ def test_apply_custom_trial_uses_exact_full_set_and_reverts_original_baseline(tm
   assert set(fake_params_cls._store["FLMActiveOverrides"]["vehicleKnobs"]) == set(supported)
   assert fake_params_cls._store["FLMActiveOverrides"]["vehicleKnobs"][first_symbol] == pytest.approx(custom_value)
   assert "legacy.extra" not in fake_params_cls._store["FLMActiveOverrides"]["vehicleKnobs"]
+  assert fake_params_cls._memory_store["StarPilotTogglesUpdated"] is True
 
   module.revert_trial_profile()
   assert fake_params_cls._store["AdvancedLateralTune"] is False

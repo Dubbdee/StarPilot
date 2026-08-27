@@ -4349,7 +4349,6 @@ def apply_trial_profile(report_id: str, profile_id: str) -> dict[str, Any]:
 def apply_custom_trial(report_id: str, payload: Any) -> dict[str, Any]:
   paths = ensure_flm_workspace()
   params = Params(return_defaults=True)
-  _require_flm_offroad(params)
   report = load_report(report_id)
   report_fingerprint = str(report.get("car", {}).get("carFingerprint", "") or "")
   current_car = _current_car_identity(params)
