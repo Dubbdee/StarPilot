@@ -69,10 +69,9 @@ TESTING_GROUNDS_SLOT_DEFINITIONS = (
   },
   {
     "id": TESTING_GROUND_6,
-    "name": "Jwarm EV6",
-    "description": "Jwarm's Kia EV6 lateral sandbox.",
+    "name": "Unused",
+    "description": "Unused slot.",
     "aLabel": "A - Installed tune",
-    "cLabel": "C - Firestar Tune",
   },
   {
     "id": TESTING_GROUND_7,

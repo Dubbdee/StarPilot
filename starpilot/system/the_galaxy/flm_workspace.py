@@ -3032,6 +3032,13 @@ def _custom_vehicle_knob_help(symbol: str) -> dict[str, Any]:
       f"Adds less predicted steering for {side}; response becomes calmer, but too little can lag or run wide.",
       analysis_why,
     )
+  if suffix.startswith("base_turn_in_boost_"):
+    return _custom_help(
+      f"Boosts the EV6 base feedforward while entering {side}, before the additional nonlinear feedforward layer.",
+      "Makes the initial curve response stronger; too much can make entry abrupt or overshoot the planned line.",
+      "Reduces the initial base response; too little can contribute to late turn-in.",
+      "This was formerly hidden in the EV6 testing-ground tune and is now owned by the active FLM trial.",
+    )
   if suffix.startswith("turn_in_boost_"):
     return _custom_help(
       f"Changes the extra feedforward applied while entering {side}, with the strongest effect at lower speeds.",
@@ -3045,6 +3052,48 @@ def _custom_vehicle_knob_help(symbol: str) -> dict[str, Any]:
       "Removes more base feedforward on exit, so steering releases sooner; too much can release abruptly.",
       "Keeps more base feedforward on exit; too little reduction can make steering hang on.",
       "This separates the vehicle's base unwind behavior from its additional nonlinear feedforward layer.",
+    )
+  if suffix.startswith("phase_unwind_target_"):
+    return _custom_help(
+      f"Sets the EV6 base-unwind target for {side} when phase confidence is high.",
+      "Pulls the base feedforward toward a stronger exit reduction, releasing steering sooner; too much can snap back.",
+      "Keeps the target nearer the base-unwind value, preserving more exit feedforward but potentially holding the curve longer.",
+      "The phase-stability controls determine how strongly this target replaces Base Unwind Taper during abrupt low-speed transitions.",
+    )
+  if suffix == "phase_stability_max_reduction":
+    return _custom_help(
+      "Sets how much abrupt low-speed transitions can weaken the EV6 base turn-in boost and phase-unwind target.",
+      "Protects more strongly against abrupt low-speed phase changes, but can reduce the intended entry and unwind correction.",
+      "Keeps more of the configured correction active, but can make abrupt low-speed transitions sharper.",
+      "Zero disables the stabilizing reduction; one allows it to suppress nearly the entire phase correction at its strongest point.",
+    )
+  if suffix == "phase_stability_speed":
+    return _custom_help(
+      "Sets the road-speed center, in m/s, below which the EV6 phase-stability reduction becomes active.",
+      "Extends the stabilizing reduction into faster driving.",
+      "Restricts the stabilizing reduction to slower driving.",
+      "The transition is gradual and its softness is controlled by Phase Stability Speed Width.",
+    )
+  if suffix == "phase_stability_speed_width":
+    return _custom_help(
+      "Sets how gradually the EV6 phase-stability reduction fades around its speed threshold, in m/s.",
+      "Spreads the reduction across a wider speed range.",
+      "Makes the speed transition sharper and more localized.",
+      "This changes the width of the speed gate, not the correction strength at full activation.",
+    )
+  if suffix == "phase_stability_jerk":
+    return _custom_help(
+      "Sets the lateral-jerk threshold, in m/s³, where an EV6 transition starts being treated as abrupt.",
+      "Requires a sharper transition before reducing the phase correction.",
+      "Begins reducing the correction during gentler transitions.",
+      "The transition is gradual and its softness is controlled by Phase Stability Jerk Width.",
+    )
+  if suffix == "phase_stability_jerk_width":
+    return _custom_help(
+      "Sets how gradually the EV6 phase-stability reduction fades around its lateral-jerk threshold, in m/s³.",
+      "Spreads the reduction across a wider jerk range.",
+      "Makes the jerk transition sharper and more localized.",
+      "This changes the width of the jerk gate, not the correction strength at full activation.",
     )
   if suffix.startswith("unwind_taper_"):
     return _custom_help(

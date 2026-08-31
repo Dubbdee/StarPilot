@@ -918,8 +918,6 @@ IONIQ_6_OUTPUT_TAPER_SPEED_WIDTH = 2.5
 IONIQ_6_OUTPUT_CENTER_TAPER_BLEND = 0.90
 IONIQ_6_OUTPUT_DIRECTIONAL_TAPER_BLEND = 0.97
 
-KIA_EV6_LATERAL_TESTING_GROUND_ID = testing_ground.id_6
-KIA_EV6_LATERAL_TESTING_GROUND_VARIANT = "C"
 KIA_EV6_FF_GAIN_LEFT = 0.12
 KIA_EV6_FF_GAIN_RIGHT = 0.17
 KIA_EV6_FF_ONSET = 0.08
@@ -934,15 +932,26 @@ KIA_EV6_UNWIND_TAPER_LEFT = 0.56
 KIA_EV6_UNWIND_TAPER_RIGHT = 0.54
 KIA_EV6_BASE_UNWIND_TAPER_LEFT = 0.10
 KIA_EV6_BASE_UNWIND_TAPER_RIGHT = 0.13
-KIA_EV6_JWARM_BASE_TURN_IN_BOOST_LEFT = 0.12
-KIA_EV6_JWARM_BASE_TURN_IN_BOOST_RIGHT = 0.14
-KIA_EV6_JWARM_BASE_UNWIND_TAPER_LEFT = 0.15
-KIA_EV6_JWARM_BASE_UNWIND_TAPER_RIGHT = 0.16
-KIA_EV6_JWARM_PHASE_STABILITY_MAX_REDUCTION = 0.25
-KIA_EV6_JWARM_PHASE_STABILITY_SPEED = 10.0
-KIA_EV6_JWARM_PHASE_STABILITY_SPEED_WIDTH = 1.8
-KIA_EV6_JWARM_PHASE_STABILITY_JERK = 0.70
-KIA_EV6_JWARM_PHASE_STABILITY_JERK_WIDTH = 0.18
+KIA_EV6_BASE_TURN_IN_BOOST_LEFT = 0.12
+KIA_EV6_BASE_TURN_IN_BOOST_RIGHT = 0.14
+KIA_EV6_PHASE_UNWIND_TARGET_LEFT = 0.15
+KIA_EV6_PHASE_UNWIND_TARGET_RIGHT = 0.16
+KIA_EV6_PHASE_STABILITY_MAX_REDUCTION = 0.25
+KIA_EV6_PHASE_STABILITY_SPEED = 10.0
+KIA_EV6_PHASE_STABILITY_SPEED_WIDTH = 1.8
+KIA_EV6_PHASE_STABILITY_JERK = 0.70
+KIA_EV6_PHASE_STABILITY_JERK_WIDTH = 0.18
+KIA_EV6_PHASE_CONTROL_DEFAULTS = {
+  "hyundai_kia_ev6.base_turn_in_boost_left": KIA_EV6_BASE_TURN_IN_BOOST_LEFT,
+  "hyundai_kia_ev6.base_turn_in_boost_right": KIA_EV6_BASE_TURN_IN_BOOST_RIGHT,
+  "hyundai_kia_ev6.phase_unwind_target_left": KIA_EV6_PHASE_UNWIND_TARGET_LEFT,
+  "hyundai_kia_ev6.phase_unwind_target_right": KIA_EV6_PHASE_UNWIND_TARGET_RIGHT,
+  "hyundai_kia_ev6.phase_stability_max_reduction": KIA_EV6_PHASE_STABILITY_MAX_REDUCTION,
+  "hyundai_kia_ev6.phase_stability_speed": KIA_EV6_PHASE_STABILITY_SPEED,
+  "hyundai_kia_ev6.phase_stability_speed_width": KIA_EV6_PHASE_STABILITY_SPEED_WIDTH,
+  "hyundai_kia_ev6.phase_stability_jerk": KIA_EV6_PHASE_STABILITY_JERK,
+  "hyundai_kia_ev6.phase_stability_jerk_width": KIA_EV6_PHASE_STABILITY_JERK_WIDTH,
+}
 KIA_EV6_FRICTION_MULT = 1.01
 KIA_EV6_FRICTION_LAT_RISE = 0.18
 KIA_EV6_FRICTION_JERK_RISE = 0.22
@@ -1268,6 +1277,14 @@ def normalize_flm_overrides(overrides) -> dict:
         normalized["vehicleKnobs"][str(key)] = float(value)
       except Exception:
         continue
+
+  # EV6 FLM trials created before the phase controls were exposed ran on top of
+  # the same values through Testing Ground slot 6. Fill those values explicitly
+  # so existing active trials and saved tunes retain identical behavior while
+  # becoming the sole source of the former hidden tune.
+  if any(key.startswith("hyundai_kia_ev6.") for key in normalized["vehicleKnobs"]):
+    for key, value in KIA_EV6_PHASE_CONTROL_DEFAULTS.items():
+      normalized["vehicleKnobs"].setdefault(key, value)
 
   if not normalized["baseFrictionThresholds"] and not normalized["vehicleKnobs"]:
     return {}
@@ -3525,10 +3542,6 @@ def get_ioniq_6_low_speed_angle_assist_torque(desired_angle_deg: float, actual_a
   return float(np.clip(current_output_torque + assist_torque, -1.0, 1.0))
 
 
-def kia_ev6_lateral_testing_ground_active() -> bool:
-  return testing_ground.use(KIA_EV6_LATERAL_TESTING_GROUND_ID, KIA_EV6_LATERAL_TESTING_GROUND_VARIANT)
-
-
 def _kia_ev6_sigmoid(x: float) -> float:
   return _sigmoid(x)
 
@@ -3551,14 +3564,30 @@ def _kia_ev6_transition_envelope(v_ego: float, desired_lateral_accel: float, des
   return _kia_ev6_low_speed_factor(v_ego) * lat_factor * jerk_factor
 
 
-def get_kia_ev6_jwarm_phase_confidence(v_ego: float, desired_lateral_jerk: float) -> float:
+def get_kia_ev6_phase_confidence(v_ego: float, desired_lateral_jerk: float) -> float:
+  max_reduction = min(max(_flm_vehicle_knob(
+    "hyundai_kia_ev6.phase_stability_max_reduction", KIA_EV6_PHASE_STABILITY_MAX_REDUCTION
+  ), 0.0), 1.0)
+  speed = _flm_vehicle_knob("hyundai_kia_ev6.phase_stability_speed", KIA_EV6_PHASE_STABILITY_SPEED)
+  speed_width = max(_flm_vehicle_knob(
+    "hyundai_kia_ev6.phase_stability_speed_width", KIA_EV6_PHASE_STABILITY_SPEED_WIDTH
+  ), 1e-3)
+  jerk = _flm_vehicle_knob("hyundai_kia_ev6.phase_stability_jerk", KIA_EV6_PHASE_STABILITY_JERK)
+  jerk_width = max(_flm_vehicle_knob(
+    "hyundai_kia_ev6.phase_stability_jerk_width", KIA_EV6_PHASE_STABILITY_JERK_WIDTH
+  ), 1e-3)
   low_speed_weight = _kia_ev6_sigmoid(
-    (KIA_EV6_JWARM_PHASE_STABILITY_SPEED - v_ego) / KIA_EV6_JWARM_PHASE_STABILITY_SPEED_WIDTH
+    (speed - v_ego) / speed_width
   )
   abrupt_transition_weight = _kia_ev6_sigmoid(
-    (abs(desired_lateral_jerk) - KIA_EV6_JWARM_PHASE_STABILITY_JERK) / KIA_EV6_JWARM_PHASE_STABILITY_JERK_WIDTH
+    (abs(desired_lateral_jerk) - jerk) / jerk_width
   )
-  return 1.0 - (KIA_EV6_JWARM_PHASE_STABILITY_MAX_REDUCTION * low_speed_weight * abrupt_transition_weight)
+  return 1.0 - (max_reduction * low_speed_weight * abrupt_transition_weight)
+
+
+def _kia_ev6_phase_controls_active() -> bool:
+  vehicle_knobs = _FLM_ACTIVE_OVERRIDES.get("vehicleKnobs", {})
+  return any(symbol in vehicle_knobs for symbol in KIA_EV6_PHASE_CONTROL_DEFAULTS)
 
 
 def get_kia_ev6_ff_scale(desired_lateral_accel: float, desired_lateral_jerk: float, v_ego: float) -> float:
@@ -3590,19 +3619,33 @@ def get_kia_ev6_ff_scale(desired_lateral_accel: float, desired_lateral_jerk: flo
                          _flm_vehicle_knob("hyundai_kia_ev6.unwind_taper_right", KIA_EV6_UNWIND_TAPER_RIGHT),
                        ) *
                          unwind_weight * (0.35 + 0.65 * low_speed_factor))
-  jwarm_tune = kia_ev6_lateral_testing_ground_active()
-  jwarm_phase_confidence = get_kia_ev6_jwarm_phase_confidence(v_ego, desired_lateral_jerk) if jwarm_tune else 0.0
-  base_turn_in_boost = 1.0 + ((_kia_ev6_side_value(
-                                desired_lateral_accel,
-                                KIA_EV6_JWARM_BASE_TURN_IN_BOOST_LEFT,
-                                KIA_EV6_JWARM_BASE_TURN_IN_BOOST_RIGHT,
-                              ) if jwarm_tune else 0.0) *
-                                jwarm_phase_confidence * turn_in_weight * onset * cutoff)
+  phase_controls_active = _kia_ev6_phase_controls_active()
+  phase_confidence = get_kia_ev6_phase_confidence(v_ego, desired_lateral_jerk) if phase_controls_active else 0.0
+  base_turn_in_boost_left = (
+    _flm_vehicle_knob("hyundai_kia_ev6.base_turn_in_boost_left", KIA_EV6_BASE_TURN_IN_BOOST_LEFT)
+    if phase_controls_active else 0.0
+  )
+  base_turn_in_boost_right = (
+    _flm_vehicle_knob("hyundai_kia_ev6.base_turn_in_boost_right", KIA_EV6_BASE_TURN_IN_BOOST_RIGHT)
+    if phase_controls_active else 0.0
+  )
+  base_turn_in_boost = 1.0 + (_kia_ev6_side_value(
+    desired_lateral_accel,
+    base_turn_in_boost_left,
+    base_turn_in_boost_right,
+  ) * phase_confidence * turn_in_weight * onset * cutoff)
   base_unwind_taper_left = _flm_vehicle_knob("hyundai_kia_ev6.base_unwind_taper_left", KIA_EV6_BASE_UNWIND_TAPER_LEFT)
   base_unwind_taper_right = _flm_vehicle_knob("hyundai_kia_ev6.base_unwind_taper_right", KIA_EV6_BASE_UNWIND_TAPER_RIGHT)
-  if jwarm_tune:
-    base_unwind_taper_left += (KIA_EV6_JWARM_BASE_UNWIND_TAPER_LEFT - base_unwind_taper_left) * jwarm_phase_confidence
-    base_unwind_taper_right += (KIA_EV6_JWARM_BASE_UNWIND_TAPER_RIGHT - base_unwind_taper_right) * jwarm_phase_confidence
+  phase_unwind_target_left = (
+    _flm_vehicle_knob("hyundai_kia_ev6.phase_unwind_target_left", KIA_EV6_PHASE_UNWIND_TARGET_LEFT)
+    if phase_controls_active else base_unwind_taper_left
+  )
+  phase_unwind_target_right = (
+    _flm_vehicle_knob("hyundai_kia_ev6.phase_unwind_target_right", KIA_EV6_PHASE_UNWIND_TARGET_RIGHT)
+    if phase_controls_active else base_unwind_taper_right
+  )
+  base_unwind_taper_left += (phase_unwind_target_left - base_unwind_taper_left) * phase_confidence
+  base_unwind_taper_right += (phase_unwind_target_right - base_unwind_taper_right) * phase_confidence
   base_unwind_taper = 1.0 - (_kia_ev6_side_value(
                               desired_lateral_accel,
                               base_unwind_taper_left,
@@ -4030,6 +4073,42 @@ FLM_SUPPORTED_VEHICLE_KNOBS = {
   "hyundai_kia_ev6.unwind_taper_right": {"profile": "hyundai_kia_ev6", "min": 0.0, "max": 1.20, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True, "defaultValue": KIA_EV6_UNWIND_TAPER_RIGHT},
   "hyundai_kia_ev6.base_unwind_taper_left": {"profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.20, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True, "defaultValue": KIA_EV6_BASE_UNWIND_TAPER_LEFT},
   "hyundai_kia_ev6.base_unwind_taper_right": {"profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.20, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True, "defaultValue": KIA_EV6_BASE_UNWIND_TAPER_RIGHT},
+  "hyundai_kia_ev6.base_turn_in_boost_left": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.40, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_BASE_TURN_IN_BOOST_LEFT,
+  },
+  "hyundai_kia_ev6.base_turn_in_boost_right": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.40, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_BASE_TURN_IN_BOOST_RIGHT,
+  },
+  "hyundai_kia_ev6.phase_unwind_target_left": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.30, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_UNWIND_TARGET_LEFT,
+  },
+  "hyundai_kia_ev6.phase_unwind_target_right": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.30, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_UNWIND_TARGET_RIGHT,
+  },
+  "hyundai_kia_ev6.phase_stability_max_reduction": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 1.0, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_STABILITY_MAX_REDUCTION,
+  },
+  "hyundai_kia_ev6.phase_stability_speed": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 25.0, "precision": 0.1, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_STABILITY_SPEED,
+  },
+  "hyundai_kia_ev6.phase_stability_speed_width": {
+    "profile": "hyundai_kia_ev6", "min": 0.1, "max": 10.0, "precision": 0.1, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_STABILITY_SPEED_WIDTH,
+  },
+  "hyundai_kia_ev6.phase_stability_jerk": {
+    "profile": "hyundai_kia_ev6", "min": 0.0, "max": 3.0, "precision": 0.01, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_STABILITY_JERK,
+  },
+  "hyundai_kia_ev6.phase_stability_jerk_width": {
+    "profile": "hyundai_kia_ev6", "min": 0.01, "max": 1.0, "precision": 0.01, "deltaType": "absolute", "safeLiveTrial": True,
+    "defaultValue": KIA_EV6_PHASE_STABILITY_JERK_WIDTH,
+  },
   "hyundai_kia_ev6.center_taper_max": {"profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.20, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True, "defaultValue": KIA_EV6_CENTER_TAPER_MAX},
   "hyundai_kia_ev6.turn_in_threshold_reduction_left": {"profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.40, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True, "defaultValue": KIA_EV6_TURN_IN_THRESHOLD_REDUCTION_LEFT},
   "hyundai_kia_ev6.turn_in_threshold_reduction_right": {"profile": "hyundai_kia_ev6", "min": 0.0, "max": 0.40, "precision": 0.001, "deltaType": "absolute", "safeLiveTrial": True, "defaultValue": KIA_EV6_TURN_IN_THRESHOLD_REDUCTION_RIGHT},

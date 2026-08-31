@@ -149,7 +149,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   get_kia_ev6_ff_scale,
   get_kia_ev6_friction_scale,
   get_kia_ev6_friction_threshold,
-  get_kia_ev6_jwarm_phase_confidence,
+  get_kia_ev6_phase_confidence,
   get_sonata_center_taper_scale,
   get_sonata_ff_scale,
   get_sonata_hybrid_center_taper_scale,
@@ -447,6 +447,27 @@ class TestLatControl:
       clear_flm_runtime_overrides()
     assert get_flm_runtime_overrides() == {}
     assert get_standard_friction_threshold(10.0) == pytest.approx(base)
+
+  def test_flm_ev6_legacy_overrides_gain_explicit_phase_controls(self):
+    migrated = normalize_flm_overrides({
+      "schemaVersion": 1,
+      "vehicleKnobs": {
+        "hyundai_kia_ev6.turn_in_boost_left": 0.625,
+        "hyundai_kia_ev6.base_turn_in_boost_left": 0.20,
+      },
+    })
+
+    controls = migrated["vehicleKnobs"]
+    assert controls["hyundai_kia_ev6.turn_in_boost_left"] == pytest.approx(0.625)
+    assert controls["hyundai_kia_ev6.base_turn_in_boost_left"] == pytest.approx(0.20)
+    for symbol, value in latcontrol_vehicle_tunes.KIA_EV6_PHASE_CONTROL_DEFAULTS.items():
+      if symbol != "hyundai_kia_ev6.base_turn_in_boost_left":
+        assert controls[symbol] == pytest.approx(value)
+
+    unrelated = normalize_flm_overrides({
+      "vehicleKnobs": {"hyundai_ioniq_6.turn_in_boost_left": 0.8},
+    })
+    assert not any(symbol in unrelated["vehicleKnobs"] for symbol in latcontrol_vehicle_tunes.KIA_EV6_PHASE_CONTROL_DEFAULTS)
 
   def test_flm_center_deadband_curve_interpolates_by_speed(self):
     overrides = normalize_flm_overrides({
@@ -1991,32 +2012,49 @@ class TestLatControl:
     assert unwind_left < 0.98
     assert unwind_right < 0.98
 
-  def test_kia_ev6_jwarm_testing_ground_phase_correction(self, monkeypatch):
+  def test_kia_ev6_phase_correction_is_owned_by_flm_controls(self):
+    neutral_controls = {
+      "hyundai_kia_ev6.base_turn_in_boost_left": 0.0,
+      "hyundai_kia_ev6.base_turn_in_boost_right": 0.0,
+      "hyundai_kia_ev6.phase_unwind_target_left": 0.10,
+      "hyundai_kia_ev6.phase_unwind_target_right": 0.13,
+    }
+    try:
+      set_flm_runtime_overrides({"vehicleKnobs": neutral_controls})
+      normal_steady = get_kia_ev6_ff_scale(0.45, 0.0, 10.0)
+      normal_turn_in_left = get_kia_ev6_ff_scale(0.45, 0.7, 10.0)
+      normal_turn_in_right = get_kia_ev6_ff_scale(-0.45, -0.7, 10.0)
+      normal_unwind_left = get_kia_ev6_ff_scale(0.45, -0.7, 10.0)
+      normal_unwind_right = get_kia_ev6_ff_scale(-0.45, 0.7, 10.0)
+
+      set_flm_runtime_overrides({"vehicleKnobs": latcontrol_vehicle_tunes.KIA_EV6_PHASE_CONTROL_DEFAULTS})
+      assert get_kia_ev6_ff_scale(0.45, 0.0, 10.0) == pytest.approx(normal_steady)
+      assert get_kia_ev6_ff_scale(0.45, 0.7, 10.0) > normal_turn_in_left + 0.08
+      assert get_kia_ev6_ff_scale(-0.45, -0.7, 10.0) > normal_turn_in_right + 0.10
+      assert get_kia_ev6_ff_scale(0.45, -0.7, 10.0) < normal_unwind_left - 0.04
+      assert get_kia_ev6_ff_scale(-0.45, 0.7, 10.0) < normal_unwind_right - 0.02
+    finally:
+      clear_flm_runtime_overrides()
+
+  def test_kia_ev6_abrupt_low_speed_phase_correction_is_bounded_and_adjustable(self):
     clear_flm_runtime_overrides()
-    monkeypatch.setattr(latcontrol_vehicle_tunes, "kia_ev6_lateral_testing_ground_active", lambda: False)
-    normal_steady = get_kia_ev6_ff_scale(0.45, 0.0, 10.0)
-    normal_turn_in_left = get_kia_ev6_ff_scale(0.45, 0.7, 10.0)
-    normal_turn_in_right = get_kia_ev6_ff_scale(-0.45, -0.7, 10.0)
-    normal_unwind_left = get_kia_ev6_ff_scale(0.45, -0.7, 10.0)
-    normal_unwind_right = get_kia_ev6_ff_scale(-0.45, 0.7, 10.0)
-
-    monkeypatch.setattr(latcontrol_vehicle_tunes, "kia_ev6_lateral_testing_ground_active", lambda: True)
-    assert get_kia_ev6_ff_scale(0.45, 0.0, 10.0) == pytest.approx(normal_steady)
-    assert get_kia_ev6_ff_scale(0.45, 0.7, 10.0) > normal_turn_in_left + 0.08
-    assert get_kia_ev6_ff_scale(-0.45, -0.7, 10.0) > normal_turn_in_right + 0.10
-    assert get_kia_ev6_ff_scale(0.45, -0.7, 10.0) < normal_unwind_left - 0.04
-    assert get_kia_ev6_ff_scale(-0.45, 0.7, 10.0) < normal_unwind_right - 0.02
-
-  def test_kia_ev6_jwarm_abrupt_low_speed_phase_correction_is_bounded(self):
-    calm_low_speed = get_kia_ev6_jwarm_phase_confidence(6.0, 0.25)
-    abrupt_low_speed = get_kia_ev6_jwarm_phase_confidence(6.0, 1.40)
-    abrupt_high_speed = get_kia_ev6_jwarm_phase_confidence(18.0, 1.40)
+    calm_low_speed = get_kia_ev6_phase_confidence(6.0, 0.25)
+    abrupt_low_speed = get_kia_ev6_phase_confidence(6.0, 1.40)
+    abrupt_high_speed = get_kia_ev6_phase_confidence(18.0, 1.40)
 
     assert abrupt_low_speed < calm_low_speed
     assert abrupt_low_speed < abrupt_high_speed
     assert 0.75 <= abrupt_low_speed < 0.82
     assert calm_low_speed > 0.90
     assert abrupt_high_speed > 0.98
+
+    try:
+      set_flm_runtime_overrides({
+        "vehicleKnobs": {"hyundai_kia_ev6.phase_stability_max_reduction": 0.0},
+      })
+      assert get_kia_ev6_phase_confidence(6.0, 1.40) == pytest.approx(1.0)
+    finally:
+      clear_flm_runtime_overrides()
 
   def test_kia_ev6_center_taper_curve(self):
     assert get_kia_ev6_center_taper_scale(0.0, 25.0) < get_kia_ev6_center_taper_scale(0.0, 10.0)
