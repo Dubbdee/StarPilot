@@ -29,16 +29,16 @@ def _model(left=-1.8, right=1.8, model_y=0.0, lane_prob=0.9, lane_std=0.1, path_
 
 
 def _update(controller, model, *, offset=0.0, authority=1.0, enabled=True, active=True, valid=True, speed=_V_EGO,
-            pause_on_signal=False, turn_signal_active=False):
+            pause_on_signal=False, turn_signal_active=False, strength=0.30, response_time=0.40, deadband=0.08):
   return controller.update(0.0, model, speed, enabled, offset, authority, active, valid,
-                           pause_on_signal, turn_signal_active)
+                           pause_on_signal, turn_signal_active, strength, response_time, deadband)
 
 
-def _converge(model, *, offset=0.0, authority=1.0):
+def _converge(model, **kwargs):
   controller = LaneCenteringController()
   output = 0.0
   for _ in range(300):
-    output = _update(controller, model, offset=offset, authority=authority)
+    output = _update(controller, model, **kwargs)
   return controller, output
 
 
@@ -111,6 +111,28 @@ def test_lane_center_error_steers_toward_center():
 def test_small_center_error_does_not_chatter():
   _, output = _converge(_model(left=-1.75, right=1.85), authority=0.0)
   assert output == 0.0
+
+
+def test_configurable_deadband_can_correct_smaller_center_error():
+  model = _model(left=-1.75, right=1.85)
+  _, default = _converge(model, authority=0.0)
+  _, tighter = _converge(model, authority=0.0, deadband=0.02)
+  assert default == 0.0
+  assert tighter > 0.0
+
+
+def test_configurable_strength_scales_steady_correction():
+  model = _model(left=-1.5, right=2.1)
+  _, default = _converge(model, authority=0.0, strength=0.30)
+  _, stronger = _converge(model, authority=0.0, strength=0.40)
+  assert stronger == pytest.approx(default * (4.0 / 3.0), rel=1e-4)
+
+
+def test_shorter_response_time_reacts_sooner():
+  model = _model(left=-1.5, right=2.1)
+  faster = _update(LaneCenteringController(), model, authority=0.0, response_time=0.25)
+  default = _update(LaneCenteringController(), model, authority=0.0, response_time=0.40)
+  assert faster > default > 0.0
 
 
 def test_offset_direction():

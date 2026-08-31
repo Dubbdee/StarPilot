@@ -702,6 +702,18 @@ class StarPilotVariables:
     toggle.lane_centering_pause_on_signal = self.get_value(
       "LaneCenteringPauseOnSignal", condition=toggle.lane_centering, default=True,
     )
+    toggle.lane_centering_strength = self.get_value(
+      "LaneCenteringStrength", cast=float, condition=toggle.lane_centering,
+      default=0.30, min=0.10, max=0.60,
+    )
+    toggle.lane_centering_response_time = self.get_value(
+      "LaneCenteringResponseTime", cast=float, condition=toggle.lane_centering,
+      default=0.40, min=0.10, max=0.80,
+    )
+    toggle.lane_centering_deadband = self.get_value(
+      "LaneCenteringDeadband", cast=float, condition=toggle.lane_centering,
+      default=0.08, min=0.0, max=0.20,
+    )
     toggle.force_auto_tune = self.get_value("ForceAutoTune", condition=advanced_lateral_tuning and not has_auto_tune and is_torque_car and not is_angle_car)
     # Force-off is also meaningful on manually tuned torque cars: it locks the
     # vehicle-model parameters instead of allowing paramsd to learn over them.

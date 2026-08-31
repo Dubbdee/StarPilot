@@ -637,7 +637,10 @@ class Controls:
       CC.latActive,
       bool(self.sm.all_checks(['modelV2'])),
       self.starpilot_toggles.lane_centering_pause_on_signal,
-      bool(CS.leftBlinker or CS.rightBlinker))
+      bool(CS.leftBlinker or CS.rightBlinker),
+      self.starpilot_toggles.lane_centering_strength,
+      self.starpilot_toggles.lane_centering_response_time,
+      self.starpilot_toggles.lane_centering_deadband)
 
     jerk_factor = 1.0
     if self.starpilot_toggles.lane_change_pace < 10:

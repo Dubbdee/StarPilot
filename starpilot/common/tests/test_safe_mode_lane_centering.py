@@ -5,6 +5,9 @@ def test_safe_mode_manages_lane_centering_settings():
   assert {
     "CameraOffset",
     "LaneCentering",
+    "LaneCenteringStrength",
+    "LaneCenteringResponseTime",
+    "LaneCenteringDeadband",
     "LaneCenteringPauseOnSignal",
     "LaneCenteringE2EAuthority",
     "LaneCenterOffset",

@@ -61,6 +61,12 @@ class SteeringManagerView(CardHubManagerView):
         "on_click": lambda: self._controller._navigate_to("behavior"),
       },
       {
+        "title": tr("Lane Centering"),
+        "desc": tr("Use detected lane lines to keep the vehicle centered and tune how quickly it responds."),
+        "icon": "road",
+        "on_click": lambda: self._controller._navigate_to("lane_centering"),
+      },
+      {
         "title": tr("Lane Changes"),
         "desc": tr("Configure automatic lane changes, speed/width thresholds, and smoothing parameters."),
         "icon": "road",
@@ -159,7 +165,47 @@ class StarPilotLateralLayout(_SettingsPage):
       ),
     ]
 
-    # ── 2. Lane Changes ──
+    # ── 2. Lane Centering ──
+    self._lane_centering_rows = [
+      SettingRow(
+        "LaneCenteringStrength", "value", tr_noop("Centering Strength"),
+        subtitle=tr_noop("How strongly detected lane-center error changes the requested path."),
+        get_value=lambda: f"{p.get_float('LaneCenteringStrength'):.2f}",
+        on_click=lambda: self._show_slider("LaneCenteringStrength", 0.10, 0.60, step=0.05, value_type="float"),
+      ),
+      SettingRow(
+        "LaneCenteringResponseTime", "value", tr_noop("Response Time"),
+        subtitle=tr_noop("How quickly centering correction changes. Lower values react and release sooner."),
+        get_value=lambda: f"{p.get_float('LaneCenteringResponseTime'):.2f}s",
+        on_click=lambda: self._show_slider("LaneCenteringResponseTime", 0.10, 0.80, step=0.05, unit="s", value_type="float"),
+      ),
+      SettingRow(
+        "LaneCenteringDeadband", "value", tr_noop("Center Deadband"),
+        subtitle=tr_noop("Lane-center error ignored before correction begins. Lower values hold center more tightly."),
+        get_value=lambda: f"{p.get_float('LaneCenteringDeadband'):.2f}m",
+        on_click=lambda: self._show_slider("LaneCenteringDeadband", 0.0, 0.20, step=0.01, unit="m", value_type="float"),
+      ),
+      SettingRow(
+        "LaneCenterOffset", "value", tr_noop("Lane Center Offset"),
+        subtitle=tr_noop("Shift the target left or right within the detected lane."),
+        get_value=lambda: f"{p.get_float('LaneCenterOffset'):.2f}m",
+        on_click=lambda: self._show_slider("LaneCenterOffset", -0.30, 0.30, step=0.01, unit="m", value_type="float"),
+      ),
+      SettingRow(
+        "LaneCenteringE2EAuthority", "value", tr_noop("E2E Override Strength"),
+        subtitle=tr_noop("How strongly the driving model may override lane centering when avoiding hazards."),
+        get_value=lambda: f"{p.get_float('LaneCenteringE2EAuthority'):.2f}",
+        on_click=lambda: self._show_slider("LaneCenteringE2EAuthority", 0.0, 1.0, step=0.05, value_type="float"),
+      ),
+      SettingRow(
+        "LaneCenteringPauseOnSignal", "toggle", tr_noop("Pause On Turn Signal"),
+        subtitle=tr_noop("Fade centering correction while a turn signal is active."),
+        get_state=lambda: p.get_bool("LaneCenteringPauseOnSignal"),
+        set_state=lambda s: p.put_bool("LaneCenteringPauseOnSignal", s),
+      ),
+    ]
+
+    # ── 3. Lane Changes ──
     self._lane_change_rows = [
       SettingRow(
         "NudgelessLaneChange", "toggle", tr_noop("Auto Lane Changes"),
@@ -219,7 +265,7 @@ class StarPilotLateralLayout(_SettingsPage):
       ),
     ]
 
-    # ── 3. Advanced Lateral Tuning ──
+    # ── 4. Advanced Lateral Tuning ──
     self._advanced_rows = [
       SettingRow(
         "NNFF", "toggle", tr_noop("NNFF"),
@@ -425,6 +471,8 @@ class StarPilotLateralLayout(_SettingsPage):
     )
     pt_lane_changes = self._make_parent("LaneChanges", "Lane Changes",
       "Allow openpilot to change lanes.")
+    pt_lane_centering = self._make_parent("LaneCentering", "Lane Centering",
+      "Use detected lane lines to bias the requested path toward lane center.")
     pt_advanced = self._make_parent("AdvancedLateralTune", "Advanced Lateral Tuning",
       "Fine-tune steering response and auto-tuning.")
 
@@ -443,6 +491,14 @@ class StarPilotLateralLayout(_SettingsPage):
       header_title=tr_noop("Lane Changes"),
       header_subtitle=tr_noop("Configure automatic lane changes, speed/width thresholds, and smoothing parameters."),
       parent_toggle=pt_lane_changes,
+      panel_style=PANEL_STYLE,
+    )
+    self._sub_panels["lane_centering"] = AetherSettingsView(
+      self,
+      [SettingSection(title="", rows=self._lane_centering_rows)],
+      header_title=tr_noop("Lane Centering"),
+      header_subtitle=tr_noop("Tune how detected lane lines correct the requested driving path."),
+      parent_toggle=pt_lane_centering,
       panel_style=PANEL_STYLE,
     )
     self._sub_panels["advanced"] = AetherSettingsView(

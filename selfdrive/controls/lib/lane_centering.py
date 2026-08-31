@@ -13,11 +13,17 @@ _MAX_LANE_WIDTH = 4.8
 _MAX_OFFSET = 0.3
 _MIN_CENTER_TO_LINE = 1.1
 _MAX_RAW_CORRECTION = 0.004
-_MAX_GAIN = 0.30
-_SMOOTH_TAU = 0.4
+_DEFAULT_GAIN = 0.30
+_MIN_GAIN = 0.10
+_MAX_GAIN = 0.60
+_DEFAULT_SMOOTH_TAU = 0.40
+_MIN_SMOOTH_TAU = 0.10
+_MAX_SMOOTH_TAU = 0.80
 _SIGNAL_RELEASE_TAU = 0.20
 _CONFIDENCE_RELEASE_TAU = 0.20
-_CENTER_ERROR_DEADBAND = 0.08
+_DEFAULT_CENTER_ERROR_DEADBAND = 0.08
+_MIN_CENTER_ERROR_DEADBAND = 0.0
+_MAX_CENTER_ERROR_DEADBAND = 0.20
 
 _E2E_MAX_PATH_STD = 0.35
 _E2E_BREAK_IN_START = 0.15
@@ -32,18 +38,22 @@ class LaneCenteringController:
     self._correction = 0.0
 
   def update(self, model_curvature, model_v2, v_ego, enabled, offset, e2e_authority, lat_active, model_valid,
-             pause_on_signal=False, turn_signal_active=False) -> float:
+             pause_on_signal=False, turn_signal_active=False, strength=_DEFAULT_GAIN,
+             response_time=_DEFAULT_SMOOTH_TAU, deadband=_DEFAULT_CENTER_ERROR_DEADBAND) -> float:
     model_curvature = float(model_curvature)
 
     try:
       v_ego = float(v_ego)
       offset = float(offset)
       e2e_authority = float(e2e_authority)
+      strength = float(strength)
+      response_time = float(response_time)
+      deadband = float(deadband)
     except (TypeError, ValueError):
       self.reset()
       return model_curvature
 
-    if not np.isfinite([v_ego, offset, e2e_authority]).all():
+    if not np.isfinite([v_ego, offset, e2e_authority, strength, response_time, deadband]).all():
       self.reset()
       return model_curvature
 
@@ -68,13 +78,16 @@ class LaneCenteringController:
       v_ego,
       float(np.clip(offset, -_MAX_OFFSET, _MAX_OFFSET)),
       float(np.clip(e2e_authority, 0.0, 1.0)),
+      float(np.clip(deadband, _MIN_CENTER_ERROR_DEADBAND, _MAX_CENTER_ERROR_DEADBAND)),
     )
     if not valid:
       self._correction = float(smooth_value(0.0, self._correction, _CONFIDENCE_RELEASE_TAU, dt=DT_CTRL))
       return model_curvature + self._correction
 
-    target = float(np.clip(raw_correction, -_MAX_RAW_CORRECTION, _MAX_RAW_CORRECTION)) * _MAX_GAIN
-    self._correction = float(smooth_value(target, self._correction, _SMOOTH_TAU, dt=DT_CTRL))
+    gain = float(np.clip(strength, _MIN_GAIN, _MAX_GAIN))
+    smooth_tau = float(np.clip(response_time, _MIN_SMOOTH_TAU, _MAX_SMOOTH_TAU))
+    target = float(np.clip(raw_correction, -_MAX_RAW_CORRECTION, _MAX_RAW_CORRECTION)) * gain
+    self._correction = float(smooth_value(target, self._correction, smooth_tau, dt=DT_CTRL))
     return model_curvature + self._correction
 
   @staticmethod
@@ -85,7 +98,8 @@ class LaneCenteringController:
   def _covers(x, distance: float) -> bool:
     return bool(x[0] <= distance <= x[-1])
 
-  def _raw_correction(self, model_v2, v_ego: float, offset: float, e2e_authority: float) -> tuple[bool, float]:
+  def _raw_correction(self, model_v2, v_ego: float, offset: float, e2e_authority: float,
+                      deadband: float) -> tuple[bool, float]:
     try:
       lane_lines = model_v2.laneLines
       probs = np.asarray(model_v2.laneLineProbs, dtype=float)
@@ -123,10 +137,10 @@ class LaneCenteringController:
       model_y = float(np.interp(lookahead, pos_x, pos_y))
       error = target_y - model_y
       error_abs = abs(error)
-      if error_abs <= _CENTER_ERROR_DEADBAND:
+      if error_abs <= deadband:
         error = 0.0
       else:
-        error = np.copysign(error_abs - _CENTER_ERROR_DEADBAND, error)
+        error = np.copysign(error_abs - deadband, error)
 
       try:
         pos_y_std = np.asarray(model_v2.position.yStd, dtype=float)
